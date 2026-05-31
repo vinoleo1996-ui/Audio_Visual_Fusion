@@ -1,0 +1,171 @@
+# Jetson Orin NX 16GB / 25W production profile.
+# All live backends are explicit. Runtime input failures are fatal.
+# The current portable C++ build rejects this target until Jetson CUDA/TensorRT
+# execution providers are linked and benchmarked.
+app:
+  name: video-speaker-id
+  profile: orin_nx_16gb_25w
+  timezone: Asia/Shanghai
+
+runtime:
+  target_latency_ms: 500
+  frame_queue_size: 6
+  audio_queue_ms: 800
+  worker_threads: 6
+  use_cuda: true
+  use_tensorrt: true
+  allow_mock_inputs: false
+
+services:
+  ingest:
+    enabled: true
+    host: 127.0.0.1
+    port: 7001
+  video:
+    enabled: true
+    host: 127.0.0.1
+    port: 7200
+  audio:
+    enabled: true
+    host: 127.0.0.1
+    port: 7100
+  asd:
+    enabled: true
+    host: 127.0.0.1
+    port: 7300
+  fusion:
+    enabled: true
+    host: 127.0.0.1
+    port: 7400
+  api:
+    enabled: true
+    host: 127.0.0.1
+    port: 8080
+  ui:
+    enabled: true
+    host: 127.0.0.1
+    port: 7050
+
+video:
+  source: camera
+  camera_backend: opencv
+  camera_index: 0
+  camera_builtin_only: false
+  width: 1280
+  height: 720
+  fps: 30
+  render_bbox: false
+  person_detector:
+    backend: yolo26_onnx
+    model_path: models/yolo/yolo26n.onnx
+    imgsz: 640
+    detect_every_n_frames: 2
+    confidence_threshold: 0.35
+  tracker:
+    backend: cpp_kalman_bytetrack
+    max_age_frames: 45
+    min_hits: 3
+    high_confidence_threshold: 0.45
+    low_confidence_threshold: 0.15
+    iou_threshold: 0.25
+
+face:
+  backend: insightface_onnx
+  model_pack: buffalo_l
+  det_size: 320
+  run_every_n_frames: 3
+  identity:
+    cosine_match_threshold: 0.38
+
+audio:
+  source: microphone
+  sample_rate: 16000
+  channels: 1
+  chunk_ms: 40
+  builtin_only: false
+  device: ""
+
+vad:
+  backend: silero_vad_onnx
+  model_path: models/vad/silero_vad_v6.onnx
+  threshold: 0.45
+  preroll_ms: 480
+  min_speech_ms: 450
+  min_silence_ms: 700
+  max_utterance_ms: 12000
+
+asr:
+  backend: sherpa_onnx_sensevoice
+  model_dir: models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+  streaming_backend: sherpa_zipformer_ctc
+  streaming_model_dir: models/asr/sherpa-onnx-streaming-zipformer-small-ctc-zh-int8-2025-04-01
+  language: zh
+  min_audio_ms: 160
+  silence_peak: 0.00005
+  tail_padding_ms: 180
+  tail_silence_peak: 0.002
+  min_text_chars: 1
+  partial_result: true
+  partial_min_audio_ms: 480
+  partial_min_text_chars: 1
+  partial_interval_ms: 400
+
+diarization:
+  segmentation_model: models/diarization/pyannote-segmentation-3.0.onnx
+  segmentation_threshold: 0.50
+  segmentation_min_segment_ms: 200
+  threshold: 0.50
+  create_threshold: 0.68
+  merge_threshold: 0.30
+  ambiguous_margin: 0.06
+  window_ms: 1200
+  hop_ms: 600
+  min_segment_ms: 900
+  min_audio_ms: 1400
+  partial_min_audio_ms: 1600
+  silence_peak: 0.00005
+  voiceprint_window_ms: 1800
+  voiceprint_hop_ms: 900
+  change_threshold: 0.50
+  short_reuse_s: 6.0
+  model_path: models/voiceprint/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+  cpu_threads: 1
+
+asd:
+  backend: lr_asd_onnx
+  model_path: models/asd/lr-asd/lr_asd_talkset.onnx
+  reference_checkpoint_path: models/asd/lr-asd/finetuning_TalkSet.model
+  window_ms: 1000
+  hop_ms: 320
+  multi_label: true
+  speaking_threshold: 0.55
+  overlap_margin: 0.12
+
+sync:
+  video_time_offset_ms: 0.0
+
+fusion:
+  offscreen_threshold: 0.42
+  visible_speaker_threshold: 0.35
+  ambiguity_margin: 0.12
+  smoothing_ms: 480
+  allow_multi_speaker: true
+  overlap:
+    enabled: true
+    max_visible_speakers: 3
+    label_when_multiple_active: overlap
+
+timeline:
+  history_s: 12.0
+  sample_interval_ms: 150
+  active_threshold: 0.55
+  visible_threshold: 0.35
+  overlap_margin: 0.12
+  interrupt_window_ms: 1200
+  visual_memory_ttl_s: 6.0
+
+ui:
+  bubble_style: wechat
+  show_tentative_results: true
+  show_latency: true
+  show_quality_boxes: true

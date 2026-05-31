@@ -1,0 +1,135 @@
+# Speaker ID Demo — Mac Local Development Configuration
+# This profile configures the gateway for Mac laptop with built-in camera.
+
+app:
+  name: video-speaker-id-live-mac
+  profile: mac_local_experience
+
+# Runtime tuning parameters
+runtime:
+  target_latency_ms: 500          # Target end-to-end fusion latency (aspirational)
+  audio_queue_max_chunks: 64      # Max audio chunks buffered before drop (backpressure)
+  utterance_queue_size: 3         # Max pending utterances in fusion queue
+  worker_threads: 4
+  allow_mock_inputs: false        # Live chain fails closed when camera or microphone is unavailable
+
+# Video capture and person detection
+video:
+  source: camera                  # 'camera' or 'file' (file mode not yet implemented)
+  camera_backend: opencv          # Open in main process so macOS camera permission works; fail clearly if unauthorized
+  camera_index: 0                 # OpenCV camera device index
+  camera_builtin_only: true       # Reject iPhone/Continuity cameras; use Mac built-in camera only
+  camera_name_allowlist: [FaceTime, Built-in, builtin, 内置, 内建]
+  camera_name_denylist: [iPhone, iPad, Continuity, Desk View, 桌上视角, Capture screen]
+  camera_resolve_timeout_s: 8.0
+  width: 1280                     # Capture resolution width
+  height: 720                     # Capture resolution height
+  fps: 30                         # FaceTime built-in camera supported capture rate
+  person_detector:
+    backend: yolo26_onnx          # Portable C++ YOLO26 ONNX detector
+    model_path: models/yolo/yolo26n.onnx  # Relative path to YOLO weights
+    imgsz: 640                
+    confidence_threshold: 0.35
+    detect_every_n_frames: 3
+  tracker:
+    backend: cpp_kalman_bytetrack
+    max_age_frames: 45
+    min_hits: 3
+    high_confidence_threshold: 0.45
+    low_confidence_threshold: 0.15
+    iou_threshold: 0.25
+  render_bbox: false              # Disable backend bounding box rendering to allow premium frontend canvas overlays
+
+# Face detection and recognition
+face:
+  backend: insightface
+  model_pack: buffalo_l
+  det_size: 320
+  run_every_n_frames: 2
+  identity:
+    cosine_match_threshold: 0.38
+
+# Audio capture parameters
+audio:
+  source: microphone
+  sample_rate: 16000
+  channels: 1
+  chunk_ms: 40
+  builtin_only: true
+  device: ""
+
+# Voice Activity Detection
+vad:
+  backend: silero_vad_onnx
+  model_path: models/vad/silero_vad_v6.onnx
+  threshold: 0.45
+  preroll_ms: 480
+  min_speech_ms: 450
+  min_silence_ms: 700
+  max_utterance_ms: 12000
+
+# Automated Speech Recognition
+asr:
+  backend: sherpa_onnx_sensevoice
+  model_dir: models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+  streaming_backend: sherpa_zipformer_ctc
+  streaming_model_dir: models/asr/sherpa-onnx-streaming-zipformer-small-ctc-zh-int8-2025-04-01
+  language: zh
+  min_audio_ms: 160
+  silence_peak: 0.00005
+  tail_padding_ms: 180
+  tail_silence_peak: 0.002
+  min_text_chars: 1
+  partial_result: true
+  partial_min_audio_ms: 480
+  partial_min_text_chars: 1
+  partial_interval_ms: 400
+
+# Active Speaker Detection
+asd:
+  backend: lr_asd_onnx
+  model_path: models/asd/lr-asd/lr_asd_talkset.onnx      # C++ portable graph
+  reference_checkpoint_path: models/asd/lr-asd/finetuning_TalkSet.model  # Python evaluation only
+  window_ms: 1000                 # Scoring window
+  hop_ms: 320                     # Hop between windows
+  speaking_threshold: 0.55
+
+# Voiceprint Speaker Diarization
+diarization:
+  segmentation_model: models/diarization/pyannote-segmentation-3.0.onnx  # Overlap-aware neural segmentation (powerset 7-class)
+  segmentation_threshold: 0.50
+  segmentation_min_segment_ms: 200   # Minimum segment duration after segmentation (merge shorter into neighbours)
+  threshold: 0.50                 # Stable same-speaker match threshold
+  create_threshold: 0.68          # Only clear new-speaker evidence creates a new SPK_ID
+  merge_threshold: 0.30           # Merge centroids that converge after early over-splitting
+  ambiguous_margin: 0.06
+  window_ms: 1200                 # Sliding speaker-embedding window for VAD-segment diarization
+  hop_ms: 600
+  min_segment_ms: 900
+  min_audio_ms: 1400              # Short commands reuse stable IDs instead of creating new SPK_IDs
+  partial_min_audio_ms: 1600      # Tentative speaker id for live partials after enough evidence
+  silence_peak: 0.00005
+  voiceprint_window_ms: 1800      # Multi-window utterance embedding aggregation for stable SPK_ID
+  voiceprint_hop_ms: 900
+  change_threshold: 0.50
+  short_reuse_s: 6.0
+  model_path: models/voiceprint/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+  cpu_threads: 1
+
+sync:
+  video_time_offset_ms: 0.0       # Calibration offset added to visual capture timestamps before LR-ASD alignment
+
+# Fusion engine parameters
+fusion:
+  visible_speaker_threshold: 0.35 # Min ASD score to consider a visible person as speaker
+  ambiguity_margin: 0.10          # Close ASD scores are treated as overlap/ambiguous instead of hard-binding one face
+  allow_multi_speaker: true       # Allow overlap detection (multi-label)
+
+timeline:
+  history_s: 12.0                 # Rolling speaker activity memory used to bind ASR to visible speakers
+  sample_interval_ms: 150
+  active_threshold: 0.55
+  visible_threshold: 0.35
+  overlap_margin: 0.12
+  interrupt_window_ms: 1200
+  visual_memory_ttl_s: 6.0

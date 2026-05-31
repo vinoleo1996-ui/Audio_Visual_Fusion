@@ -1,0 +1,29 @@
+# C++ build directories
+build/
+bin/
+lib/
+cmake-build-*/
+.cmake/
+
+# Model weights and temporary downloads
+models/
+*.zip
+*.tar.gz
+*.tar.bz2
+*.part
+
+# Log and output files
+out/
+out_*/
+*.log
+*.mp4
+*.wav
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
