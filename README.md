@@ -15,11 +15,13 @@
 ├── include/               # 项目公共头文件目录
 │   └── speaker_id/
 │       ├── api/
-│       ├── core/          # 管道线（Pipeline）、事件与配置接口
+│       ├── capture/       # [新增] 视频流捕获接口（libav_video_capture.hpp）
+│       ├── core/          # 管道线（Pipeline）、事件与配置接口（包含新增的 audio_clock.hpp）
 │       └── modules/       # 视觉、音频、ASR、ASD 等子模块接口
 ├── src/                   # 源代码实现目录
 │   ├── config.cpp         # YAML 配置加载器
 │   ├── pipeline.cpp       # 多线程流式管道线主逻辑
+│   ├── capture/           # [新增] 基于 FFmpeg/libav 的硬件/本地设备视频捕获实现
 │   ├── gateway/           # Gateway 服务器与 WebSocket 通信实现
 │   └── modules/           # 各模型推理模块实现 (ASD、ASR、Face、Diarization)
 ├── tests/                 # 单元测试与集成测试
@@ -42,10 +44,11 @@
 3. **ONNX Runtime**：用于运行 LR-ASD 主动说话人检测模型、人脸检测/识别模型等。
 4. **Sherpa ONNX**：用作 ASR（SenseVoice / Zipformer）推理后端与声纹聚类引擎。
 5. **yaml-cpp**：自动通过 CMake FetchContent 获取（也可使用系统级安装包）。
+6. **FFmpeg/Libav（可选）**：用于硬件及摄像头流的原生视频捕获（包括 `libavformat`, `libavcodec`, `libavdevice`, `libavutil`, `libswscale`）。在 macOS/Linux 上安装后，CMake 将通过 `PkgConfig` 自动检测并编译 `src/capture/libav_video_capture.cpp` 模块，同时定义宏 `SPEAKER_ID_HAS_LIBAV=1`。
 
 ### macOS 安装依赖示例
 ```bash
-brew install opencv onnxruntime
+brew install opencv onnxruntime ffmpeg pkg-config
 ```
 
 ---
@@ -111,4 +114,5 @@ ctest --output-on-failure
 ## 边缘就绪声明与运行提示
 
 - **边缘端意向目标**：本 C++ 仓是为 Jetson Orin NX 等计算边缘端量身定制的高性能运行方案。
+- **音频/视频时钟同步**：本次更新引入了 `audio_clock.hpp`，提供更精准的高精度单调音频参考时钟；若检测到 PkgConfig 包含 `libav` 系列库，则原生编译 `libav_video_capture.cpp` 用于底层摄像头硬件直采。
 - **现状说明**：当前项目主干的实时可运行网关依然是 **Python Gateway (`gateway/main.py`)**。在 C++ 仓完全完成基于 TensorRT 加速器、硬解码、以及 Orin NX 开发板上的完整 Latency/Accuracy 测试前，请勿将其直接作为默认生产就绪版本。
