@@ -8,10 +8,23 @@ app:
 # Runtime tuning parameters
 runtime:
   target_latency_ms: 500          # Target end-to-end fusion latency (aspirational)
-  audio_queue_max_chunks: 64      # Max audio chunks buffered before drop (backpressure)
-  utterance_queue_size: 3         # Max pending utterances in fusion queue
+  frame_queue_size: 2             # Latest-frame queue: drop stale camera frames before model inference
+  audio_queue_ms: 800             # Max audio buffered before capture applies backpressure
+  event_ring_size: 512            # Independent SSE cursors replay events from this bounded ring
   worker_threads: 4
   allow_mock_inputs: false        # Live chain fails closed when camera or microphone is unavailable
+  session_log_path: output/session_debug/cpp_live_mac.jsonl
+
+capture:
+  backend: ffmpeg_pipe_pll        # libav_pts is reserved for the linked PTS adapter benchmark
+
+ui:
+  preview:
+    width: 960                    # Independent low-latency preview; analysis remains 1280x720
+    height: 540
+    fps: 15
+    jpeg_quality: 75
+    max_frame_age_ms: 200         # Browser drops stale or out-of-order preview frames
 
 # Video capture and person detection
 video:
@@ -25,19 +38,23 @@ video:
   width: 1280                     # Capture resolution width
   height: 720                     # Capture resolution height
   fps: 30                         # FaceTime built-in camera supported capture rate
+  max_detection_result_age_ms: 250
   person_detector:
     backend: yolo26_onnx          # Portable C++ YOLO26 ONNX detector
     model_path: models/yolo/yolo26n.onnx  # Relative path to YOLO weights
     imgsz: 640                
     confidence_threshold: 0.35
+    nms_threshold: 0.45
     detect_every_n_frames: 3
   tracker:
     backend: cpp_kalman_bytetrack
-    max_age_frames: 45
+    max_age_frames: 90             # Keep internal ID memory through short occlusion; render TTL remains short
+    render_grace_ms: 350
     min_hits: 3
     high_confidence_threshold: 0.45
     low_confidence_threshold: 0.15
     iou_threshold: 0.25
+    center_distance_threshold: 0.65 # Recover fast motion when async detections have weak IoU
   render_bbox: false              # Disable backend bounding box rendering to allow premium frontend canvas overlays
 
 # Face detection and recognition
@@ -45,7 +62,18 @@ face:
   backend: insightface
   model_pack: buffalo_l
   det_size: 320
-  run_every_n_frames: 2
+  run_every_n_frames: 4           # SCRFD target: 7.5 FPS at 30 FPS capture
+  det_confidence_threshold: 0.45
+  hold_ms: 600                    # Project landmarks briefly between direct face observations
+  asd_crop_ttl_ms: 1200           # Occluded crops may bridge only short interruptions
+  tracked_asd_crop_ttl_ms: 2600   # Person-backed projected crops may bridge longer while body tracking is healthy
+  identity_embedding_interval_ms: 750  # ArcFace target: 1-2 FPS per recognized track
+  min_bbox_size_px: 8             # Reject invalid and tiny ROI before resize/model calls
+  render_green_hold_ms: 650       # Short person-backed projection remains stable green
+  render_reacquire_hold_ms: 1600  # Longer projection is explicitly shown as reacquiring
+  asd_crop_max_geometry_age_ms: 650 # Mouth evidence must stay fresh even when the person ID is held longer
+  asd_crop_edge_margin_px: 12      # Reject clipped faces at the camera boundary before LR-ASD
+  asd_crop_min_visible_ratio: 0.90 # Reject partially visible face crops instead of scoring garbage geometry
   identity:
     cosine_match_threshold: 0.38
 
@@ -92,6 +120,10 @@ asd:
   reference_checkpoint_path: models/asd/lr-asd/finetuning_TalkSet.model  # Python evaluation only
   window_ms: 1000                 # Scoring window
   hop_ms: 320                     # Hop between windows
+  vad_hangover_ms: 500            # Keep ASD warm briefly after VAD closes for final attribution
+  min_crop_count: 20              # Require face-backed visual coverage before LR-ASD inference
+  max_crop_gap_ms: 120
+  max_candidate_tracks: 4
   speaking_threshold: 0.55
 
 # Voiceprint Speaker Diarization
@@ -118,9 +150,19 @@ diarization:
 
 sync:
   video_time_offset_ms: 0.0       # Calibration offset added to visual capture timestamps before LR-ASD alignment
+  max_watermark_lag_ms: 250       # Gate ASD binding when audio/video watermarks exceed this gap
+  reanchor_threshold_ms: 500      # Re-anchor FFmpeg pipe audio clock and flush stale ASD history
+  pll_alpha: 0.08                 # Bounded monotonic correction from chunk arrival time
+  max_correction_per_chunk_ms: 8
+
+diagnostics:
+  session_replay_enabled: true    # Local-only TTL recorder used for C++/Python LR-ASD parity checks
+  session_replay_dir: output/session_replay
+  session_replay_ttl_minutes: 60
 
 # Fusion engine parameters
 fusion:
+  offscreen_threshold: 0.25       # Below this score, visible tracks do not explain audible speech
   visible_speaker_threshold: 0.35 # Min ASD score to consider a visible person as speaker
   ambiguity_margin: 0.10          # Close ASD scores are treated as overlap/ambiguous instead of hard-binding one face
   allow_multi_speaker: true       # Allow overlap detection (multi-label)

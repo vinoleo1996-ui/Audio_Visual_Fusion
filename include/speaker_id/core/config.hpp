@@ -20,6 +20,20 @@ struct RuntimeConfig {
   bool use_cuda = false;
   bool use_tensorrt = false;
   bool allow_mock_inputs = false;
+  std::string session_log_path;
+  std::size_t event_ring_size = 512;
+};
+
+struct CaptureConfig {
+  std::string backend = "ffmpeg_pipe_pll";
+};
+
+struct PreviewConfig {
+  int width = 960;
+  int height = 540;
+  int fps = 15;
+  int jpeg_quality = 75;
+  int max_frame_age_ms = 200;
 };
 
 struct VideoConfig {
@@ -35,11 +49,17 @@ struct VideoConfig {
   std::string person_detector_backend = "ultralytics_yolo";
   std::string person_detector_model_path = "models/yolo/yolov8n.pt";
   float person_detector_conf_threshold = 0.35F;
+  float person_detector_nms_threshold = 0.45F;
   int person_detector_imgsz = 640;
   int person_detector_detect_every_n_frames = 3;
+  int max_detection_result_age_ms = 250;
+  std::vector<std::string> camera_name_allowlist;
+  std::vector<std::string> camera_name_denylist;
   float tracker_high_confidence_threshold = 0.45F;
   float tracker_low_confidence_threshold = 0.15F;
   float tracker_iou_threshold = 0.25F;
+  float tracker_center_distance_threshold = 0.65F;
+  int tracker_render_grace_ms = 350;
   int tracker_max_age_frames = 45;
   int tracker_min_hits = 3;
 };
@@ -49,7 +69,18 @@ struct FaceConfig {
   std::string model_pack = "buffalo_l";
   int det_size = 320;
   int run_every_n_frames = 5;
+  float det_confidence_threshold = 0.45F;
+  int hold_ms = 600;
+  int asd_crop_ttl_ms = 1200;
+  int tracked_asd_crop_ttl_ms = 2600;
+  int identity_embedding_interval_ms = 750;
   float cosine_match_threshold = 0.38F;
+  int min_bbox_size_px = 8;
+  int render_green_hold_ms = 650;
+  int render_reacquire_hold_ms = 1600;
+  int asd_crop_max_geometry_age_ms = 650;
+  int asd_crop_edge_margin_px = 12;
+  float asd_crop_min_visible_ratio = 0.90F;
 };
 
 struct AudioConfig {
@@ -94,6 +125,10 @@ struct AsdConfig {
   std::string reference_checkpoint_path = "models/asd/lr-asd/finetuning_TalkSet.model";
   int window_ms = 1000;
   int hop_ms = 320;
+  int vad_hangover_ms = 500;
+  int min_crop_count = 20;
+  int max_crop_gap_ms = 120;
+  int max_candidate_tracks = 4;
   float speaking_threshold = 0.55F;
 };
 
@@ -109,9 +144,20 @@ struct DiarizationConfig {
 
 struct SyncConfig {
   float video_time_offset_ms = 0.0F;
+  int max_watermark_lag_ms = 250;
+  int reanchor_threshold_ms = 500;
+  double pll_alpha = 0.08;
+  int max_correction_per_chunk_ms = 8;
+};
+
+struct DiagnosticsConfig {
+  bool session_replay_enabled = false;
+  std::string session_replay_dir = "output/session_replay";
+  int session_replay_ttl_minutes = 60;
 };
 
 struct FusionConfig {
+  float offscreen_threshold = 0.25F;
   float visible_speaker_threshold = 0.35F;
   float ambiguity_margin = 0.10F;
   bool allow_multi_speaker = true;
@@ -130,6 +176,8 @@ struct AppConfig {
   std::string name = "video-speaker-id";
   std::string profile = "default";
   RuntimeConfig runtime;
+  CaptureConfig capture;
+  PreviewConfig preview;
   VideoConfig video;
   FaceConfig face;
   AudioConfig audio;
@@ -138,6 +186,7 @@ struct AppConfig {
   AsdConfig asd;
   DiarizationConfig diarization;
   SyncConfig sync;
+  DiagnosticsConfig diagnostics;
   FusionConfig fusion;
   TimelineConfig timeline;
   std::map<std::string, ServiceConfig> services;

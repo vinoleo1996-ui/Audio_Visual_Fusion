@@ -6,6 +6,37 @@
 #include <iostream>
 
 namespace speaker_id {
+namespace {
+
+double MonotonicNowSeconds() {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::duration<double>>(now).count();
+}
+
+float NormalizedCenterDistance(const BBox& left, const BBox& right) {
+  const float left_width = std::max(1.0F, left.x2 - left.x1);
+  const float left_height = std::max(1.0F, left.y2 - left.y1);
+  const float right_width = std::max(1.0F, right.x2 - right.x1);
+  const float right_height = std::max(1.0F, right.y2 - right.y1);
+  const float dx = (left.x1 + left.x2 - right.x1 - right.x2) * 0.5F;
+  const float dy = (left.y1 + left.y2 - right.y1 - right.y2) * 0.5F;
+  const float scale =
+      std::max(1.0F, std::sqrt((left_width * left_width + left_height * left_height +
+                                right_width * right_width + right_height * right_height) *
+                               0.5F));
+  return std::sqrt(dx * dx + dy * dy) / scale;
+}
+
+bool HasCompatibleScale(const BBox& left, const BBox& right) {
+  const float left_area =
+      std::max(1.0F, (left.x2 - left.x1) * (left.y2 - left.y1));
+  const float right_area =
+      std::max(1.0F, (right.x2 - right.x1) * (right.y2 - right.y1));
+  const float ratio = left_area / right_area;
+  return ratio >= 0.20F && ratio <= 5.0F;
+}
+
+}  // namespace
 
 float ComputeIou(const BBox& a, const BBox& b) {
   float x1 = std::max(a.x1, b.x1);
@@ -169,12 +200,14 @@ SimplePersonTracker::SimplePersonTracker(
     float high_threshold,
     float low_threshold,
     float iou_threshold,
-    int min_hits)
+    int min_hits,
+    float center_distance_threshold)
     : max_age_s_(max_age_s),
       render_grace_s_(render_grace_s),
       high_threshold_(high_threshold),
       low_threshold_(low_threshold),
       iou_threshold_(iou_threshold),
+      center_distance_threshold_(center_distance_threshold),
       min_hits_(std::max(1, min_hits)) {}
 
 void SimplePersonTracker::MergeDuplicateIdentities() {
@@ -198,6 +231,7 @@ void SimplePersonTracker::MergeDuplicateIdentities() {
         keep.bbox = drop.bbox;
         keep.quality = drop.quality;
         keep.last_seen = std::max(keep.last_seen, drop.last_seen);
+        keep.last_predict = std::max(keep.last_predict, drop.last_predict);
         keep.misses = std::min(keep.misses, drop.misses);
         keep.hits = std::max(keep.hits, drop.hits);
         keep.track_state = drop.track_state;
@@ -228,10 +262,7 @@ std::vector<TrackEvent> SimplePersonTracker::Update(const std::vector<BBox>& box
 std::vector<TrackEvent> SimplePersonTracker::Update(
     const std::vector<PersonDetection>& detections, int width, int height) {
   MergeDuplicateIdentities();
-  
-  // Get current monotonic time in seconds
-  auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-  double now = static_cast<double>(now_ns) / 1e9;
+  const double now = MonotonicNowSeconds();
 
   // Step 1: Partition detections into high and low confidence groups
   std::vector<PersonDetection> high_dets;
@@ -247,12 +278,14 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
   // Step 2: Predict current expected position for each track via Kalman Filter
   std::map<int, BBox> predictions;
   for (auto& [track_id, track] : tracks_) {
-    float dt = static_cast<float>(now - track.last_seen);
+    const double previous_predict = track.last_predict > 0.0 ? track.last_predict : track.last_seen;
+    float dt = static_cast<float>(now - previous_predict);
     if (filters_.count(track_id) > 0) {
       predictions[track_id] = filters_[track_id]->Predict(dt);
     } else {
       predictions[track_id] = track.bbox;
     }
+    track.last_predict = now;
   }
 
   std::vector<int> candidate_ids;
@@ -276,8 +309,14 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
       int track_id = candidate_ids[i];
       BBox pred_box = predictions[track_id];
       for (size_t j = 0; j < high_dets.size(); ++j) {
-        float cost = 1.0F - ComputeIou(pred_box, high_dets[j].bbox);
-        if (cost <= 1.0F - iou_threshold_) {
+        const float iou = ComputeIou(pred_box, high_dets[j].bbox);
+        const float center_distance =
+            NormalizedCenterDistance(pred_box, high_dets[j].bbox);
+        const bool motion_recovery =
+            center_distance <= center_distance_threshold_ &&
+            HasCompatibleScale(pred_box, high_dets[j].bbox);
+        float cost = iou >= iou_threshold_ ? 1.0F - iou : 1.0F + center_distance;
+        if (iou >= iou_threshold_ || motion_recovery) {
           options.push_back({static_cast<int>(i), static_cast<int>(j), cost});
         }
       }
@@ -303,21 +342,14 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
         if (filters_.count(track_id) == 0) {
           filters_[track_id] = std::make_unique<KalmanFilter>(det);
         } else {
-          BBox raw_smoothed = filters_[track_id]->Update(det);
-          BBox prev = tracks_[track_id].bbox;
-          // Temporal EMA coordinate filtering for stability
-          smoothed_box = BBox{
-              0.82F * prev.x1 + 0.18F * raw_smoothed.x1,
-              0.82F * prev.y1 + 0.18F * raw_smoothed.y1,
-              0.82F * prev.x2 + 0.18F * raw_smoothed.x2,
-              0.82F * prev.y2 + 0.18F * raw_smoothed.y2
-          };
+          smoothed_box = filters_[track_id]->Update(det);
         }
 
         auto& track = tracks_[track_id];
         track.bbox = smoothed_box;
         track.quality = QualityForBox(smoothed_box, width, height, track.quality);
         track.last_seen = now;
+        track.last_predict = now;
         track.misses = 0;
         track.hits++;
         track.track_state = "tracked";
@@ -348,8 +380,14 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
       int track_id = remaining_candidates[i];
       BBox pred_box = predictions[track_id];
       for (size_t j = 0; j < low_dets.size(); ++j) {
-        float cost = 1.0F - ComputeIou(pred_box, low_dets[j].bbox);
-        if (cost <= 1.0F - iou_threshold_) {
+        const float iou = ComputeIou(pred_box, low_dets[j].bbox);
+        const float center_distance =
+            NormalizedCenterDistance(pred_box, low_dets[j].bbox);
+        const bool motion_recovery =
+            center_distance <= center_distance_threshold_ * 0.75F &&
+            HasCompatibleScale(pred_box, low_dets[j].bbox);
+        float cost = iou >= iou_threshold_ ? 1.0F - iou : 1.0F + center_distance;
+        if (iou >= iou_threshold_ || motion_recovery) {
           options.push_back({static_cast<int>(i), static_cast<int>(j), cost});
         }
       }
@@ -375,20 +413,14 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
         if (filters_.count(track_id) == 0) {
           filters_[track_id] = std::make_unique<KalmanFilter>(det);
         } else {
-          BBox raw_smoothed = filters_[track_id]->Update(det);
-          BBox prev = tracks_[track_id].bbox;
-          smoothed_box = BBox{
-              0.82F * prev.x1 + 0.18F * raw_smoothed.x1,
-              0.82F * prev.y1 + 0.18F * raw_smoothed.y1,
-              0.82F * prev.x2 + 0.18F * raw_smoothed.x2,
-              0.82F * prev.y2 + 0.18F * raw_smoothed.y2
-          };
+          smoothed_box = filters_[track_id]->Update(det);
         }
 
         auto& track = tracks_[track_id];
         track.bbox = smoothed_box;
         track.quality = QualityForBox(smoothed_box, width, height, track.quality);
         track.last_seen = now;
+        track.last_predict = now;
         track.misses = 0;
         track.hits++;
         track.track_state = "tracked";
@@ -418,11 +450,11 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
     }
     Track track;
     track.person_track_id = next_id_;
-    track.face_track_id = next_id_ + 1000;
     track.bbox = high_dets[j].bbox;
     track.quality = QualityForBox(high_dets[j].bbox, width, height);
     track.track_state = "tracked";
     track.last_seen = now;
+    track.last_predict = now;
     track.misses = 0;
     track.hits = 1;
     track.confidence = high_dets[j].confidence;
@@ -444,7 +476,40 @@ std::vector<TrackEvent> SimplePersonTracker::Update(
     filters_.erase(track_id);
   }
 
-  // Prepare visible tracks output
+  return VisibleTracks(now);
+}
+
+std::vector<TrackEvent> SimplePersonTracker::PredictOnly(int width, int height) {
+  (void)width;
+  (void)height;
+  MergeDuplicateIdentities();
+  const double now = MonotonicNowSeconds();
+  for (auto& [track_id, track] : tracks_) {
+    const double previous_predict = track.last_predict > 0.0 ? track.last_predict : track.last_seen;
+    const float dt = static_cast<float>(now - previous_predict);
+    if (filters_.count(track_id) > 0) {
+      track.bbox = filters_[track_id]->Predict(dt);
+    }
+    track.last_predict = now;
+  }
+  return VisibleTracks(now);
+}
+
+void SimplePersonTracker::ApplyIdentityHints(const std::vector<TrackEvent>& tracks) {
+  for (const auto& event : tracks) {
+    if (!event.face_track_id.has_value() || event.identity_state == "unknown") {
+      continue;
+    }
+    const auto track = tracks_.find(event.person_track_id);
+    if (track == tracks_.end()) {
+      continue;
+    }
+    track->second.face_track_id = event.face_track_id;
+    track->second.identity_id = event.face_track_id;
+  }
+}
+
+std::vector<TrackEvent> SimplePersonTracker::VisibleTracks(double now) const {
   std::vector<TrackEvent> visible;
   for (const auto& [track_id, track] : tracks_) {
     if (track.hits >= min_hits_ &&

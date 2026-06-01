@@ -11,9 +11,21 @@
 #include <stdexcept>
 #include <numeric>
 #include <chrono>
-#include <unordered_set>
 
 namespace speaker_id {
+
+bool ClampBBoxToFrame(BBox& box, int width, int height, int min_size_px) {
+  if (!std::isfinite(box.x1) || !std::isfinite(box.y1) ||
+      !std::isfinite(box.x2) || !std::isfinite(box.y2) ||
+      width <= 0 || height <= 0) {
+    return false;
+  }
+  box.x1 = std::clamp(box.x1, 0.0F, static_cast<float>(width));
+  box.y1 = std::clamp(box.y1, 0.0F, static_cast<float>(height));
+  box.x2 = std::clamp(box.x2, 0.0F, static_cast<float>(width));
+  box.y2 = std::clamp(box.y2, 0.0F, static_cast<float>(height));
+  return box.x2 - box.x1 >= min_size_px && box.y2 - box.y1 >= min_size_px;
+}
 
 // L2-normalize helper
 std::vector<float> NormalizeEmbedding(const std::vector<float>& vec) {
@@ -68,6 +80,10 @@ float FacePersonMatchScore(const BBox& face, const BBox& person) {
 
 // ROI generation logic
 cv::Rect GetHeadROI(const BBox& bbox, int width, int height) {
+  if (!std::isfinite(bbox.x1) || !std::isfinite(bbox.y1) ||
+      !std::isfinite(bbox.x2) || !std::isfinite(bbox.y2)) {
+    return cv::Rect();
+  }
   float p_w = std::max(1.0F, bbox.x2 - bbox.x1);
   float p_h = std::max(1.0F, bbox.y2 - bbox.y1);
   float pad_x = p_w * 0.12F;
@@ -287,7 +303,10 @@ void FaceEngine::ReloadGallery(const std::string& gallery_path) {
 
 std::vector<FaceDetection> FaceEngine::DetectFaces(const cv::Mat& frame, float det_threshold) {
   std::vector<FaceDetection> detections;
-  if (frame.empty()) return detections;
+  if (frame.empty() || frame.cols < config_.min_bbox_size_px ||
+      frame.rows < config_.min_bbox_size_px) {
+    return detections;
+  }
 
   // Preprocess input size to square det_size
   int det_size = config_.det_size;
@@ -303,6 +322,8 @@ std::vector<FaceDetection> FaceEngine::DetectFaces(const cv::Mat& frame, float d
     new_w = det_size;
     new_h = static_cast<int>(new_w * im_ratio);
   }
+  new_w = std::max(1, new_w);
+  new_h = std::max(1, new_h);
   scale = static_cast<float>(new_h) / frame.rows;
 
   cv::Mat resized;
@@ -415,8 +436,26 @@ std::vector<FaceDetection> FaceEngine::DetectFaces(const cv::Mat& frame, float d
   for (int idx : indices) {
     FaceDetection d;
     d.bbox = decoded_boxes[idx];
+    if (!ClampBBoxToFrame(d.bbox, frame.cols, frame.rows,
+                          config_.min_bbox_size_px)) {
+      continue;
+    }
     d.det_score = decoded_scores[idx];
     d.landmarks = decoded_landmarks[idx];
+    bool landmarks_valid = true;
+    for (auto& landmark : d.landmarks) {
+      if (!std::isfinite(landmark.first) || !std::isfinite(landmark.second)) {
+        landmarks_valid = false;
+        break;
+      }
+      landmark.first =
+          std::clamp(landmark.first, 0.0F, static_cast<float>(frame.cols));
+      landmark.second =
+          std::clamp(landmark.second, 0.0F, static_cast<float>(frame.rows));
+    }
+    if (!landmarks_valid) {
+      continue;
+    }
     
     // Evaluate quality immediately
     float q_score = 0.0F;
@@ -772,27 +811,10 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
   int height = frame.rows;
   int width = frame.cols;
 
-  // 1. Garbage collect stale tracking state maps
-  std::unordered_set<int> active_ids;
-  for (const auto& t : out_tracks) {
-    active_ids.insert(t.person_track_id);
-  }
+  // Async jobs can be older than the current tracker state. State GC belongs to
+  // the live person tracker lifecycle, never to an individual stale face job.
 
-  for (auto it = face_filters_.begin(); it != face_filters_.end();) {
-    if (active_ids.count(it->first) == 0) {
-      last_update_times_.erase(it->first);
-      last_face_relative_boxes_.erase(it->first);
-      last_observed_faces_.erase(it->first);
-      quality_states_.erase(it->first);
-      identity_states_.erase(it->first);
-      track_embeddings_history_.erase(it->first);
-      it = face_filters_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // 2. Perform secondary face detection on local head ROIs for active person tracks
+  // 1. Perform secondary face detection on local head ROIs for active person tracks
   // This yields a massive detection accuracy boost compared to full-image downscaled runs.
   bool run_detection = (frame_count % std::max(1, config_.run_every_n_frames) == 0);
 
@@ -813,7 +835,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
 
       // Extract upper body / head region for fine-grained SCRFD face detection
       cv::Mat roi = frame(roi_rect).clone();
-      auto roi_faces = DetectFaces(roi, 0.45F);
+      auto roi_faces = DetectFaces(roi, config_.det_confidence_threshold);
 
       int best_idx = -1;
       float best_match_score = -1.0F;
@@ -874,7 +896,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
     }
   }
 
-  // 3. Process each track's state machine (confirmed / tracking / held / low_quality / unknown)
+  // 2. Process each track's state machine (confirmed / tracking / held / low_quality / unknown)
   const double now_s = capture_timestamp_ms / 1000.0;
 
   for (auto& track : out_tracks) {
@@ -906,17 +928,31 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
         face_filters_[pid]->Predict(dt);
         track.face.bbox = face_filters_[pid]->Update(det.bbox);
       }
+      if (!ClampBBoxToFrame(track.face.bbox, width, height,
+                            config_.min_bbox_size_px)) {
+        continue;
+      }
       last_update_times_[pid] = {static_cast<float>(now_s), static_cast<float>(now_s)};
 
       // Smooth landmarks
       track.face.landmarks_5pt = SmoothLandmarks(pid, det.landmarks);
       track.face.face_bbox_observed = true;
+      track.face.observation_state = "observed";
       track.face.face_bbox_last_observed_ms = capture_timestamp_ms;
+      track.face.geometry_timestamp_ms = capture_timestamp_ms;
+      track.face.geometry_age_ms = 0;
 
-      // Extract ArcFace embedding if quality permits
+      // ArcFace is intentionally sparse: SCRFD maintains geometry while embeddings update identity memory.
       std::vector<float> embedding;
-      if (det.quality == Quality::kGood || det.quality == Quality::kOk) {
+      const auto last_embedding = last_identity_embedding_ms_.find(pid);
+      const bool embedding_due =
+          last_embedding == last_identity_embedding_ms_.end() ||
+          capture_timestamp_ms - last_embedding->second >=
+              config_.identity_embedding_interval_ms;
+      if (det.quality == Quality::kGood &&
+          (id_state.assigned_id == -1 || embedding_due)) {
         embedding = ExtractEmbedding(frame, track.face.landmarks_5pt);
+        last_identity_embedding_ms_[pid] = capture_timestamp_ms;
       }
 
       // Smooth and evaluate quality label
@@ -932,6 +968,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
       std::string quality_str = StableQualityLabel(pid, det.det_score, det.blur_score, area_ratio, margin_ratio);
       track.face.quality = (quality_str == "good") ? Quality::kGood : ((quality_str == "ok") ? Quality::kOk : Quality::kLow);
       track.face.quality_score = det.quality_score;
+      track.face.embedding_eligible = det.quality == Quality::kGood;
 
       // Run Re-ID recognition matching
       if (!embedding.empty()) {
@@ -953,6 +990,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
             if (id_state.consecutive_count >= 3) {
               track.face_track_id = matched_id;
               track.identity_confidence = confidence;
+              id_state.confidence = confidence;
 
               if (static_gallery_.count(matched_id) > 0) {
                 id_state.name = static_gallery_[matched_id].name;
@@ -968,6 +1006,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
 
       // Store face-to-body relative ratio
       track.face.face_bbox_observed = true;
+      track.face.observation_state = "observed";
       last_face_relative_boxes_[pid] = BBox{
           (track.face.bbox.x1 - track.bbox.x1) / body_w,
           (track.face.bbox.y1 - track.bbox.y1) / body_h,
@@ -998,11 +1037,17 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
           last_observed_faces_[pid].bbox,
           track.face.bbox);
       
-      float last_obs_ms = last_observed_faces_[pid].face_bbox_last_observed_ms;
-      if (last_obs_ms > 0 && (capture_timestamp_ms - last_obs_ms) <= 600) {
-        track.face.face_bbox_observed = true;
+      const auto last_obs_ms = last_observed_faces_[pid].face_bbox_last_observed_ms;
+      if (last_obs_ms > 0 && (capture_timestamp_ms - last_obs_ms) <= config_.hold_ms) {
+        track.face.face_bbox_observed = false;
+        track.face.observation_state = "projected";
       } else {
         track.face.face_bbox_observed = false;
+        track.face.observation_state =
+            last_obs_ms > 0 &&
+                    capture_timestamp_ms - last_obs_ms <= config_.asd_crop_ttl_ms
+                ? "occluded"
+                : "expired";
         track.face.quality = Quality::kLow;
       }
       
@@ -1016,7 +1061,7 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
       last_update_times_[pid] = {static_cast<float>(now_s), static_cast<float>(now_s)};
       
       // Maintain previous identity state
-      if (id_state.assigned_id != -1) {
+      if (id_state.assigned_id != -1 && id_state.state != "unknown") {
         track.face_track_id = id_state.assigned_id;
       }
       
@@ -1047,16 +1092,23 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
             last_observed_faces_[pid].bbox,
             track.face.bbox);
         
-        float last_obs_ms = last_observed_faces_[pid].face_bbox_last_observed_ms;
-        if (last_obs_ms > 0 && (capture_timestamp_ms - last_obs_ms) <= 600) {
-          track.face.face_bbox_observed = true;
-          if (id_state.assigned_id != -1) {
+        const auto last_obs_ms = last_observed_faces_[pid].face_bbox_last_observed_ms;
+        if (last_obs_ms > 0 &&
+            (capture_timestamp_ms - last_obs_ms) <= config_.hold_ms) {
+          track.face.face_bbox_observed = false;
+          track.face.observation_state = "projected";
+          if (id_state.assigned_id != -1 && id_state.state != "unknown") {
             track.face_track_id = id_state.assigned_id;
           }
         } else {
           track.face.face_bbox_observed = false; // not directly observed now
+          track.face.observation_state =
+              last_obs_ms > 0 &&
+                      capture_timestamp_ms - last_obs_ms <= config_.asd_crop_ttl_ms
+                  ? "occluded"
+                  : "expired";
           track.face.quality = Quality::kLow; // degrade quality under occlusion
-          if (id_state.assigned_id != -1) {
+          if (id_state.assigned_id != -1 && id_state.state != "unknown") {
             track.face_track_id = id_state.assigned_id;
             id_state.state = "held";
           }
@@ -1065,19 +1117,27 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
         // Never observed face, project a default ROI
         track.face.bbox = DefaultProjectFaceBBox(track.bbox);
         track.face.face_bbox_observed = false;
+        track.face.observation_state = "expired";
         track.face.quality = Quality::kLow;
         id_state.state = "unknown";
       }
     }
 
-    // 4. Fill final schema fields
+    // 3. Fill final schema fields
     track.body.bbox = track.bbox;
     track.body.quality = track.quality;
     track.body.source = "yolo26_person";
 
-    track.identity_id = (id_state.assigned_id != -1) ? ((static_gallery_.count(id_state.assigned_id) > 0 ? "" : "I") + std::to_string(id_state.assigned_id)) : "";
+    const bool identity_visible = id_state.assigned_id != -1 && id_state.state != "unknown";
+    if (identity_visible) {
+      track.face_track_id = id_state.assigned_id;
+    } else {
+      track.face_track_id.reset();
+    }
+    track.identity_id = identity_visible ? "I" + std::to_string(id_state.assigned_id) : "";
     track.identity_name = id_state.name;
     track.identity_state = id_state.state;
+    track.identity_confidence = id_state.confidence;
     
     // Smooth rendering attributes — expand face box for better UI display
     track.render.bbox = ExpandBBox(track.face.bbox, 1.25F, 1.35F, width, height);
@@ -1090,14 +1150,21 @@ std::vector<TrackEvent> FaceEngine::UpdateTracks(
                          track.face.bbox.y2 > height - 15.0F);
 
     // Determine color state matching: confirmed + good, held + occluded, low_quality, active_speaker
-    if (track.face.quality == Quality::kLow || id_state.state == "held" || !track.face.face_bbox_observed || is_on_border) {
+    if (track.face.observation_state == "occluded" ||
+        track.face.observation_state == "expired" ||
+        id_state.state == "held" || is_on_border) {
       track.render.color_state = "low_quality"; // Gray BBox
+      track.render.state = "occluded";
       track.render.show_glow = false;
-    } else if (track.face.quality == Quality::kGood) {
+    } else if (track.track_state == "tracked" &&
+               (track.face.observation_state == "observed" ||
+                track.face.observation_state == "projected")) {
       track.render.color_state = "confirmed_good"; // Green
+      track.render.state = "stable_tracking";
       track.render.show_glow = true;
     } else {
       track.render.color_state = "tracking_ok"; // Yellow
+      track.render.state = "reacquiring";
       track.render.show_glow = false;
     }
 

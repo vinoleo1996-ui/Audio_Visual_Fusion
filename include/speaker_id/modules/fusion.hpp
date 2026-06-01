@@ -2,6 +2,7 @@
 
 #include "speaker_id/core/types.hpp"
 
+#include <string>
 #include <vector>
 
 namespace speaker_id {
@@ -11,6 +12,7 @@ struct FusionInput {
   std::vector<VadEvent> vad_segments;
   std::vector<UtteranceEvent> utterances;
   std::vector<ActiveSpeakerScore> active_speaker_scores;
+  std::string asd_failure_reason;
 };
 
 class FusionBackend {
@@ -24,7 +26,10 @@ class RuleFusionBackend final : public FusionBackend {
   explicit RuleFusionBackend(
       int frame_width = 1280,
       float active_threshold = 0.55F,
-      float visible_threshold = 0.35F);
+      float visible_threshold = 0.35F,
+      float offscreen_threshold = 0.25F,
+      float ambiguity_margin = 0.10F,
+      bool allow_multi_speaker = true);
 
   std::vector<SpeakerAttribution> Fuse(const FusionInput& input) override;
 
@@ -36,6 +41,9 @@ class RuleFusionBackend final : public FusionBackend {
   int frame_width_ = 1280;
   float active_threshold_ = 0.55F;
   float visible_threshold_ = 0.35F;
+  float offscreen_threshold_ = 0.25F;
+  float ambiguity_margin_ = 0.10F;
+  bool allow_multi_speaker_ = true;
 };
 
 std::vector<FusionEvent> BuildFusionEvents(

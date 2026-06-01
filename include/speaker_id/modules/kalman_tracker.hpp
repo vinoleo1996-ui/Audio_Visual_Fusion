@@ -30,6 +30,7 @@ struct Track {
   Quality quality = Quality::kLow;
   std::string track_state = "predicted";
   double last_seen = 0.0;
+  double last_predict = 0.0;
   int misses = 0;
   std::optional<int> identity_id;
   float confidence = 0.0F;
@@ -49,12 +50,15 @@ class SimplePersonTracker {
       float high_threshold = 0.35F,
       float low_threshold = 0.15F,
       float iou_threshold = 0.20F,
-      int min_hits = 1);
+      int min_hits = 1,
+      float center_distance_threshold = 0.65F);
 
   ~SimplePersonTracker() = default;
 
   std::vector<TrackEvent> Update(const std::vector<PersonDetection>& detections, int width, int height);
   std::vector<TrackEvent> Update(const std::vector<BBox>& boxes, int width, int height);
+  std::vector<TrackEvent> PredictOnly(int width, int height);
+  void ApplyIdentityHints(const std::vector<TrackEvent>& tracks);
 
  private:
   float max_age_s_;
@@ -62,6 +66,7 @@ class SimplePersonTracker {
   float high_threshold_;
   float low_threshold_;
   float iou_threshold_;
+  float center_distance_threshold_;
   int min_hits_;
   int next_id_ = 1;
 
@@ -69,6 +74,7 @@ class SimplePersonTracker {
   std::map<int, std::unique_ptr<KalmanFilter>> filters_;
 
   void MergeDuplicateIdentities();
+  std::vector<TrackEvent> VisibleTracks(double now) const;
 };
 
 float ComputeIou(const BBox& a, const BBox& b);

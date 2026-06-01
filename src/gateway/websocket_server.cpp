@@ -126,18 +126,6 @@ std::string Trim(std::string str) {
   return str;
 }
 
-bool WriteAll(int fd, const uint8_t* data, size_t size) {
-  size_t total = 0;
-  while (total < size) {
-    ssize_t n = write(fd, data + total, size - total);
-    if (n <= 0) {
-      return false;
-    }
-    total += n;
-  }
-  return true;
-}
-
 } // namespace
 
 WebSocketServer::WebSocketServer(const std::string& host, int port)
@@ -190,6 +178,7 @@ void WebSocketServer::Stop() {
   }
 
   if (server_fd_ != -1) {
+    shutdown(server_fd_, SHUT_RDWR);
     close(server_fd_);
     server_fd_ = -1;
   }
@@ -280,6 +269,10 @@ void WebSocketServer::HandleClient(int client_fd) {
   timeout.tv_sec = 0;
   timeout.tv_usec = 8000;
   setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#ifdef SO_NOSIGPIPE
+  int no_sigpipe = 1;
+  setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
 
   {
     std::lock_guard<std::mutex> lock(clients_mu_);
@@ -331,7 +324,13 @@ void WebSocketServer::BroadcastBinary(const std::vector<uint8_t>& data) {
   std::lock_guard<std::mutex> lock(clients_mu_);
   for (auto it = client_fds_.begin(); it != client_fds_.end(); ) {
     int fd = *it;
-    if (!WriteAll(fd, frame.data(), frame.size())) {
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    const auto written = send(fd, frame.data(), frame.size(), flags);
+    if (written != static_cast<ssize_t>(frame.size())) {
+      ++dropped_frames_;
       close(fd);
       it = client_fds_.erase(it);
     } else {

@@ -15,6 +15,8 @@
 
 namespace speaker_id {
 
+bool ClampBBoxToFrame(BBox& box, int width, int height, int min_size_px);
+
 struct FaceDetection {
   BBox bbox;
   float det_score = 0.0F;
@@ -77,6 +79,7 @@ class FaceEngine {
   std::map<int, std::pair<float, float>> last_update_times_;
   std::map<int, BBox> last_face_relative_boxes_;
   std::map<int, FaceInfo> last_observed_faces_;
+  std::map<int, std::int64_t> last_identity_embedding_ms_;
   
   // Track quality state machine (stable_label, pending_label, pending_count)
   struct QualityState {
@@ -93,6 +96,7 @@ class FaceEngine {
     std::string name = "unknown";
     std::string state = "unknown";
     int consecutive_count = 0;
+    float confidence = 0.0F;
   };
   std::map<int, IdentityState> identity_states_;
 

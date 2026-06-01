@@ -39,6 +39,7 @@ class BoundedQueue {
     }
     if (queue_.size() >= capacity_) {
       queue_.pop(); // Discard oldest frame to keep latency minimal
+      ++dropped_count_;
     }
     queue_.push(std::move(value));
     not_empty_.notify_one();
@@ -57,6 +58,17 @@ class BoundedQueue {
     return value;
   }
 
+  std::optional<T> TryPop() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (queue_.empty()) {
+      return std::nullopt;
+    }
+    T value = std::move(queue_.front());
+    queue_.pop();
+    not_full_.notify_one();
+    return value;
+  }
+
   void Close() {
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -66,14 +78,24 @@ class BoundedQueue {
     not_full_.notify_all();
   }
 
+  std::size_t Size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return queue_.size();
+  }
+
+  std::size_t DroppedCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return dropped_count_;
+  }
+
  private:
   std::size_t capacity_;
   std::queue<T> queue_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::condition_variable not_empty_;
   std::condition_variable not_full_;
   bool closed_ = false;
+  std::size_t dropped_count_ = 0;
 };
 
 }  // namespace speaker_id
-

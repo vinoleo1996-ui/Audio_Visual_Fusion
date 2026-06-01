@@ -3,11 +3,26 @@
 #include "speaker_id/core/types.hpp"
 
 #include <map>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace speaker_id {
+
+std::vector<float> ExtractLrAsdMfcc(const std::vector<float>& samples, int sample_rate);
+
+struct AsdTimelinePoint {
+  std::int64_t timestamp_ms = 0;
+  std::vector<ActiveSpeakerScore> scores;
+};
+
+std::vector<ActiveSpeakerScore> AggregateAsdScoresForUtterance(
+    const UtteranceEvent& utterance,
+    const std::deque<AsdTimelinePoint>& timeline,
+    const std::vector<ActiveSpeakerScore>& latest_scores,
+    float active_threshold,
+    int hop_ms);
 
 struct AsdVisualSample {
   std::int64_t timestamp_ms = 0;

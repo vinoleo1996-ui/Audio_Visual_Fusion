@@ -31,7 +31,7 @@ float MelToHertz(float mel) {
   return 700.0F * (std::pow(10.0F, mel / 2595.0F) - 1.0F);
 }
 
-std::vector<float> ExtractMfcc(const std::vector<float>& samples, int sample_rate) {
+std::vector<float> ExtractMfccImpl(const std::vector<float>& samples, int sample_rate) {
   if (samples.empty() || sample_rate <= 0) {
     return {};
   }
@@ -47,10 +47,15 @@ std::vector<float> ExtractMfcc(const std::vector<float>& samples, int sample_rat
     }
   }
 
-  std::vector<float> emphasized(normalized.size());
-  emphasized[0] = normalized[0] * 32768.0F;
-  for (std::size_t index = 1; index < normalized.size(); ++index) {
-    emphasized[index] = (normalized[index] - 0.97F * normalized[index - 1]) * 32768.0F;
+  std::vector<float> int16_signal(normalized.size());
+  for (std::size_t index = 0; index < normalized.size(); ++index) {
+    const auto value = std::clamp(normalized[index] * 32768.0F, -32768.0F, 32767.0F);
+    int16_signal[index] = static_cast<float>(static_cast<std::int16_t>(value));
+  }
+  std::vector<float> emphasized(int16_signal.size());
+  emphasized[0] = int16_signal[0];
+  for (std::size_t index = 1; index < int16_signal.size(); ++index) {
+    emphasized[index] = int16_signal[index] - 0.97F * int16_signal[index - 1];
   }
 
   const int frame_length = static_cast<int>(std::round(0.025F * sample_rate));
@@ -79,24 +84,24 @@ std::vector<float> ExtractMfcc(const std::vector<float>& samples, int sample_rat
   std::vector<float> last_coefficients(kMfccCoefficients, 0.0F);
   for (int frame_index = 0; frame_index < std::min(frame_count, kMfccFrames); ++frame_index) {
     cv::Mat signal = cv::Mat::zeros(1, fft_size, CV_32F);
-    float energy = 0.0F;
     for (int sample_index = 0; sample_index < frame_length; ++sample_index) {
       const std::size_t source_index =
           static_cast<std::size_t>(frame_index * frame_step + sample_index);
       const float value = source_index < emphasized.size() ? emphasized[source_index] : 0.0F;
       signal.at<float>(0, sample_index) = value;
-      energy += value * value;
     }
-    energy = std::max(energy, std::numeric_limits<float>::epsilon());
 
     cv::Mat spectrum;
     cv::dft(signal, spectrum, cv::DFT_COMPLEX_OUTPUT);
     std::vector<float> power(spectrum_size, 0.0F);
+    float energy = 0.0F;
     for (int index = 0; index < spectrum_size; ++index) {
       const auto value = spectrum.at<cv::Vec2f>(0, index);
       power[index] = (value[0] * value[0] + value[1] * value[1]) /
                      static_cast<float>(fft_size);
+      energy += power[index];
     }
+    energy = std::max(energy, std::numeric_limits<float>::epsilon());
 
     std::vector<float> log_filter_banks(kFilterBanks, 0.0F);
     for (int filter = 0; filter < kFilterBanks; ++filter) {
@@ -125,6 +130,7 @@ std::vector<float> ExtractMfcc(const std::vector<float>& samples, int sample_rat
       }
       value *= coefficient == 0 ? std::sqrt(1.0F / kFilterBanks)
                                 : std::sqrt(2.0F / kFilterBanks);
+      value *= 1.0F + 11.0F * std::sin(kPi * coefficient / 22.0F);
       last_coefficients[coefficient] = value;
     }
     last_coefficients[0] = std::log(energy);
@@ -178,6 +184,67 @@ float Mean(const float* values, std::size_t count) {
 }
 
 }  // namespace
+
+std::vector<float> ExtractLrAsdMfcc(const std::vector<float>& samples, int sample_rate) {
+  return ExtractMfccImpl(samples, sample_rate);
+}
+
+std::vector<ActiveSpeakerScore> AggregateAsdScoresForUtterance(
+    const UtteranceEvent& utterance,
+    const std::deque<AsdTimelinePoint>& timeline,
+    const std::vector<ActiveSpeakerScore>& latest_scores,
+    float active_threshold,
+    int hop_ms) {
+  if (!utterance.final) {
+    return latest_scores;
+  }
+  std::map<int, std::vector<ActiveSpeakerScore>> grouped;
+  for (const auto& point : timeline) {
+    if (point.timestamp_ms < utterance.start_ms ||
+        point.timestamp_ms > utterance.end_ms + 250) {
+      continue;
+    }
+    for (const auto& score : point.scores) {
+      grouped[score.person_track_id].push_back(score);
+    }
+  }
+  std::vector<ActiveSpeakerScore> aggregated;
+  for (const auto& [track_id, values] : grouped) {
+    std::vector<float> probabilities;
+    probabilities.reserve(values.size());
+    int longest_active_run = 0;
+    int active_run = 0;
+    int active_count = 0;
+    for (const auto& value : values) {
+      probabilities.push_back(value.p_active);
+      if (value.p_active >= active_threshold) {
+        ++active_count;
+        ++active_run;
+        longest_active_run = std::max(longest_active_run, active_run);
+      } else {
+        active_run = 0;
+      }
+    }
+    auto ordered = probabilities;
+    std::sort(ordered.begin(), ordered.end());
+    const auto p75_index =
+        static_cast<std::size_t>(std::round((ordered.size() - 1) * 0.75F));
+    ActiveSpeakerScore score = values.back();
+    score.person_track_id = track_id;
+    score.timestamp_ms = utterance.end_ms;
+    score.mean_p_active =
+        std::accumulate(probabilities.begin(), probabilities.end(), 0.0F) /
+        static_cast<float>(probabilities.size());
+    score.peak_p_active = *std::max_element(probabilities.begin(), probabilities.end());
+    score.p_active = ordered[p75_index];
+    score.active_ratio =
+        static_cast<float>(active_count) / static_cast<float>(probabilities.size());
+    score.stable_ms = longest_active_run * hop_ms;
+    score.uncertainty_flags.push_back("utterance_range_p75");
+    aggregated.push_back(std::move(score));
+  }
+  return aggregated;
+}
 
 std::vector<ActiveSpeakerScore> SimpleAsdBackend::ScoreWindow(const AsdInputWindow& window) {
   std::vector<ActiveSpeakerScore> scores;
@@ -236,7 +303,7 @@ OrtLrAsdBackend::~OrtLrAsdBackend() = default;
 
 std::vector<ActiveSpeakerScore> OrtLrAsdBackend::ScoreWindow(const AsdInputWindow& window) {
   std::vector<ActiveSpeakerScore> scores;
-  const auto mfcc = ExtractMfcc(window.audio_samples, window.sample_rate);
+  const auto mfcc = ExtractLrAsdMfcc(window.audio_samples, window.sample_rate);
   if (mfcc.empty()) {
     return scores;
   }
@@ -280,6 +347,7 @@ std::vector<ActiveSpeakerScore> OrtLrAsdBackend::ScoreWindow(const AsdInputWindo
     score.person_track_id = track.person_track_id;
     score.face_track_id = track.face_track_id;
     score.timestamp_ms = window.end_ms;
+    score.raw_p_active = raw;
     score.p_active = impl_->Smooth(track.person_track_id, raw);
     score.p_audible_speaking = window.speech_active ? 1.0F : 0.0F;
     score.p_visual_mouth_motion = raw;

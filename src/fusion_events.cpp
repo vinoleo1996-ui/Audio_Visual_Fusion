@@ -33,10 +33,16 @@ float ActiveScoreForPerson(const std::vector<ActiveSpeakerScore>& scores, int pe
 RuleFusionBackend::RuleFusionBackend(
     int frame_width,
     float active_threshold,
-    float visible_threshold)
+    float visible_threshold,
+    float offscreen_threshold,
+    float ambiguity_margin,
+    bool allow_multi_speaker)
     : frame_width_(frame_width),
       active_threshold_(active_threshold),
-      visible_threshold_(visible_threshold) {}
+      visible_threshold_(visible_threshold),
+      offscreen_threshold_(offscreen_threshold),
+      ambiguity_margin_(ambiguity_margin),
+      allow_multi_speaker_(allow_multi_speaker) {}
 
 std::vector<SpeakerAttribution> RuleFusionBackend::Fuse(const FusionInput& input) {
   std::vector<SpeakerAttribution> results;
@@ -52,6 +58,9 @@ std::vector<SpeakerAttribution> RuleFusionBackend::Fuse(const FusionInput& input
     std::vector<std::pair<float, const TrackEvent*>> scored;
     scored.reserve(input.tracks.size());
     for (const auto& track : input.tracks) {
+      if (track.track_state != "tracked") {
+        continue;
+      }
       scored.push_back({ScoreForPerson(input, track.person_track_id), &track});
     }
     std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
@@ -65,21 +74,50 @@ std::vector<SpeakerAttribution> RuleFusionBackend::Fuse(const FusionInput& input
       }
     }
 
-    if (active.size() >= 2U) {
+    const bool close_visible_scores =
+        scored.size() >= 2U && scored[0].first >= visible_threshold_ &&
+        scored[1].first >= visible_threshold_ &&
+        scored[0].first - scored[1].first <= ambiguity_margin_;
+
+    if (allow_multi_speaker_ && active.size() >= 2U) {
       attribution.position = "overlap";
       attribution.person_track_ids = {active[0]->person_track_id, active[1]->person_track_id};
       attribution.confidence = scored.empty() ? 0.0F : scored.front().first;
+      attribution.decision_reason = "multiple_confirmed_visible_speakers";
     } else if (active.size() == 1U) {
       attribution.position = PositionForTrack(*active[0]);
       attribution.person_track_ids = {active[0]->person_track_id};
       attribution.confidence = scored.empty() ? 0.0F : scored.front().first;
+      attribution.decision_reason = "confirmed_visible_speaker";
+    } else if (allow_multi_speaker_ && close_visible_scores) {
+      attribution.position = "ambiguous";
+      attribution.confidence = scored.front().first;
+      attribution.decision_reason = "close_visible_candidates";
     } else if (!scored.empty() && scored.front().first >= visible_threshold_) {
       attribution.position = PositionForTrack(*scored.front().second);
       attribution.person_track_ids = {scored.front().second->person_track_id};
       attribution.confidence = scored.front().first;
+      attribution.tentative = true;
+      attribution.decision_reason = "tentative_visible_candidate";
+    } else if (input.active_speaker_scores.empty() && !input.tracks.empty()) {
+      attribution.position = "ambiguous";
+      attribution.confidence = 0.0F;
+      attribution.decision_reason =
+          input.asd_failure_reason.empty()
+              ? "visible_tracks_without_usable_asd_window"
+              : input.asd_failure_reason;
+    } else if (!scored.empty() && scored.front().first >= offscreen_threshold_) {
+      attribution.position = "ambiguous";
+      attribution.confidence = scored.front().first;
+      attribution.decision_reason = "weak_visible_evidence";
+    } else if (!scored.empty()) {
+      attribution.position = "ambiguous";
+      attribution.confidence = 1.0F - scored.front().first;
+      attribution.decision_reason = "visible_tracks_with_conflicting_asd_evidence";
     } else {
       attribution.position = "offscreen";
-      attribution.confidence = 0.72F;
+      attribution.confidence = 0.0F;
+      attribution.decision_reason = "no_visible_tracks";
     }
 
     results.push_back(attribution);
@@ -144,10 +182,13 @@ std::vector<FusionEvent> BuildFusionEvents(
     event.stability = utterance->stability;
     event.token_timestamps_s = utterance->token_timestamps_s;
     event.tentative = attribution.tentative;
+    event.decision_reason = attribution.decision_reason;
 
     for (const auto& track : input.tracks) {
       FusionTrackView view;
       view.person_track_id = track.person_track_id;
+      view.track_snapshot_sequence = track.track_snapshot_sequence;
+      view.snapshot_timestamp_ms = track.snapshot_timestamp_ms;
       view.face_track_id = track.face_track_id;
       view.bbox = track.bbox;
       view.quality = track.quality;

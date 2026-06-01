@@ -29,6 +29,11 @@ endif()
 
 # Find OpenCV
 find_package(OpenCV REQUIRED)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBAV QUIET IMPORTED_TARGET
+    libavformat libavcodec libavdevice libavutil libswscale)
+endif()
 
 # Find ONNX Runtime
 find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime/onnxruntime_cxx_api.h
@@ -101,6 +106,11 @@ add_library(speaker_id_core
   src/gateway/websocket_server.cpp
   src/gateway/gateway_server.cpp
 )
+if(LIBAV_FOUND)
+  target_sources(speaker_id_core PRIVATE src/capture/libav_video_capture.cpp)
+  target_link_libraries(speaker_id_core PUBLIC PkgConfig::LIBAV)
+  target_compile_definitions(speaker_id_core PUBLIC SPEAKER_ID_HAS_LIBAV=1)
+endif()
 
 target_include_directories(speaker_id_core PUBLIC 
   include

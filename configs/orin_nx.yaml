@@ -15,6 +15,7 @@ runtime:
   use_cuda: true
   use_tensorrt: true
   allow_mock_inputs: false
+  session_log_path: output/session_debug/cpp_orin_nx.jsonl
 
 services:
   ingest:
@@ -61,9 +62,11 @@ video:
     imgsz: 640
     detect_every_n_frames: 2
     confidence_threshold: 0.35
+    nms_threshold: 0.45
   tracker:
     backend: cpp_kalman_bytetrack
     max_age_frames: 45
+    render_grace_ms: 350
     min_hits: 3
     high_confidence_threshold: 0.45
     low_confidence_threshold: 0.15
@@ -74,6 +77,10 @@ face:
   model_pack: buffalo_l
   det_size: 320
   run_every_n_frames: 3
+  det_confidence_threshold: 0.45
+  hold_ms: 600
+  asd_crop_ttl_ms: 1200
+  identity_embedding_interval_ms: 600
   identity:
     cosine_match_threshold: 0.38
 
@@ -145,7 +152,7 @@ sync:
   video_time_offset_ms: 0.0
 
 fusion:
-  offscreen_threshold: 0.42
+  offscreen_threshold: 0.25
   visible_speaker_threshold: 0.35
   ambiguity_margin: 0.12
   smoothing_ms: 480

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <map>
+#include <type_traits>
 #include <vector>
 #include <iomanip>
 
@@ -58,12 +59,36 @@ std::string EscapeJsonString(const std::string& input) {
   return ss.str();
 }
 
+std::int64_t MonotonicNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::int64_t SystemNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+template <typename T>
+void AppendLittleEndian(std::vector<std::uint8_t>& output, T value) {
+  using Unsigned = std::make_unsigned_t<T>;
+  const auto bits = static_cast<Unsigned>(value);
+  for (std::size_t index = 0; index < sizeof(T); ++index) {
+    output.push_back(static_cast<std::uint8_t>((bits >> (index * 8)) & 0xFF));
+  }
+}
+
 } // namespace
 
 std::string GatewayServer::SerializeFusionEvent(const FusionEvent& ev) const {
   std::lock_guard<std::mutex> lock(gallery_mu_);
   
-  std::string type = ev.text.empty() ? "asd_update" : (ev.final ? "fusion" : "asr_partial");
+  std::string type = ev.event_type.empty()
+                         ? (ev.text.empty() ? "asd_update"
+                                            : (ev.final ? "fusion" : "asr_partial"))
+                         : ev.event_type;
   
   // Determine speaker_id and speaker_name
   std::string speaker_id = ev.speaker_id;
@@ -114,9 +139,11 @@ std::string GatewayServer::SerializeFusionEvent(const FusionEvent& ev) const {
   std::stringstream ss;
   ss << "{"
      << "\"type\":\"" << type << "\","
+     << "\"event_sequence\":" << ev.event_sequence << ","
      << "\"utterance_id\":\"" << ev.utterance_id << "\","
      << "\"speaker_id\":\"" << speaker_id << "\","
      << "\"speaker_name\":\"" << EscapeJsonString(speaker_name) << "\","
+     << "\"voice_spk_id\":\"" << EscapeJsonString(ev.voice_spk_id) << "\","
      << "\"start_ms\":" << ev.start_ms << ","
      << "\"end_ms\":" << ev.end_ms << ","
      << "\"text\":\"" << EscapeJsonString(ev.text) << "\","
@@ -139,15 +166,30 @@ std::string GatewayServer::SerializeFusionEvent(const FusionEvent& ev) const {
   }
   ss << "],";
   ss << "\"tentative\":" << (ev.tentative ? "true" : "false") << ",";
+  ss << "\"decision_reason\":\"" << EscapeJsonString(ev.decision_reason) << "\",";
+  ss << "\"debug\":{\"decision_reason\":\"" << EscapeJsonString(ev.decision_reason)
+     << "\"},";
   ss << "\"tracks\":[";
   for (size_t i = 0; i < ev.tracks.size(); ++i) {
+    if (type != "track_update" && type != "asd_update") {
+      break;
+    }
     if (i > 0) ss << ",";
     const auto& t = ev.tracks[i];
+    if (type == "asd_update") {
+      ss << "{"
+         << "\"person_track_id\":" << t.person_track_id << ","
+         << "\"p_active\":" << t.p_active
+         << "}";
+      continue;
+    }
     
     BBox face_box = t.render.bbox;
     
     ss << "{"
-       << "\"person_track_id\":" << t.person_track_id << ",";
+       << "\"person_track_id\":" << t.person_track_id << ","
+       << "\"track_snapshot_sequence\":" << t.track_snapshot_sequence << ","
+       << "\"snapshot_timestamp_ms\":" << t.snapshot_timestamp_ms << ",";
     if (t.face_track_id) {
       int fid = *t.face_track_id;
       ss << "\"face_track_id\":" << fid << ",";
@@ -175,6 +217,11 @@ std::string GatewayServer::SerializeFusionEvent(const FusionEvent& ev) const {
     
     ss << "\"face\":{"
        << "\"face_bbox_observed\":" << (t.face.face_bbox_observed ? "true" : "false") << ","
+       << "\"observation_state\":\"" << EscapeJsonString(t.face.observation_state) << "\","
+       << "\"face_bbox_last_observed_ms\":" << t.face.face_bbox_last_observed_ms << ","
+       << "\"geometry_timestamp_ms\":" << t.face.geometry_timestamp_ms << ","
+       << "\"geometry_age_ms\":" << t.face.geometry_age_ms << ","
+       << "\"embedding_eligible\":" << (t.face.embedding_eligible ? "true" : "false") << ","
        << "\"quality_score\":" << t.face.quality_score << ","
        << "\"bbox\":{\"x1\":" << t.face.bbox.x1 << ",\"y1\":" << t.face.bbox.y1 << ",\"x2\":" << t.face.bbox.x2 << ",\"y2\":" << t.face.bbox.y2 << "},"
        << "\"landmarks_5pt\":[";
@@ -189,6 +236,7 @@ std::string GatewayServer::SerializeFusionEvent(const FusionEvent& ev) const {
        << "\"bbox\":{\"x1\":" << t.render.bbox.x1 << ",\"y1\":" << t.render.bbox.y1 << ",\"x2\":" << t.render.bbox.x2 << ",\"y2\":" << t.render.bbox.y2 << "},"
        << "\"label\":\"" << EscapeJsonString(t.render.label) << "\","
        << "\"color_state\":\"" << t.render.color_state << "\","
+       << "\"state\":\"" << t.render.state << "\","
        << "\"show_glow\":" << (t.render.show_glow ? "true" : "false")
        << "}";
 
@@ -232,6 +280,7 @@ void GatewayServer::Stop() {
   }
 
   ws_server_->Stop();
+  preview_cv_.notify_all();
   if (http_server_) {
     http_server_->stop();
   }
@@ -241,10 +290,35 @@ void GatewayServer::Stop() {
   }
 }
 
-void GatewayServer::BroadcastVideoFrame(const std::vector<uint8_t>& jpeg_bytes) {
+void GatewayServer::BroadcastVideoFrame(
+    const std::vector<uint8_t>& jpeg_bytes, std::uint64_t frame_sequence,
+    std::int64_t capture_timestamp_ms) {
   if (running_) {
-    ws_server_->BroadcastBinary(jpeg_bytes);
+    {
+      std::lock_guard<std::mutex> lock(preview_mu_);
+      latest_preview_jpeg_ = jpeg_bytes;
+      latest_preview_sequence_ = frame_sequence;
+    }
+    preview_cv_.notify_all();
+    const auto send_monotonic_ms = MonotonicNowMs();
+    const auto send_epoch_ms = SystemNowMs();
+    std::vector<std::uint8_t> envelope;
+    envelope.reserve(44U + jpeg_bytes.size());
+    envelope.insert(envelope.end(), {'S', 'P', 'K', 'V'});
+    envelope.push_back(1);
+    envelope.insert(envelope.end(), {0, 0, 0});
+    AppendLittleEndian(envelope, frame_sequence);
+    AppendLittleEndian(envelope, capture_timestamp_ms);
+    AppendLittleEndian(envelope, send_monotonic_ms);
+    AppendLittleEndian(envelope, send_epoch_ms);
+    AppendLittleEndian(envelope, static_cast<std::uint32_t>(jpeg_bytes.size()));
+    envelope.insert(envelope.end(), jpeg_bytes.begin(), jpeg_bytes.end());
+    ws_server_->BroadcastBinary(envelope);
   }
+}
+
+std::uint64_t GatewayServer::VideoFramesDropped() const {
+  return ws_server_ ? ws_server_->DroppedFrames() : 0;
 }
 
 void GatewayServer::ReportCameraStatus(
@@ -414,7 +488,7 @@ void GatewayServer::HttpThreadLoop() {
 
   svr.Get("/v2/status", [this](const Request&, Response& res) {
     res.set_header("Access-Control-Allow-Origin", "*");
-    const auto tracks = pipeline_->GetCurrentTracks();
+    const auto metrics = pipeline_->GetMetrics();
     const auto pipeline_error = pipeline_->GetLatestError();
     std::lock_guard<std::mutex> lock(status_mu_);
     const auto latest_error = latest_error_.empty() ? pipeline_error : latest_error_;
@@ -446,14 +520,67 @@ void GatewayServer::HttpThreadLoop() {
        << "\"asd\":\"" << EscapeJsonString(config_.asd.backend) << "\""
        << "},"
        << "\"fusion\":{"
-       << "\"visible_tracks\":" << tracks.size() << ","
+       << "\"visible_tracks\":" << metrics.rendered_face_track_count << ","
        << "\"multi_label_asd\":true,"
        << "\"tentative_results\":true,"
        << "\"llm_commit_requires_final\":true"
        << "},"
        << "\"sync\":{"
        << "\"timestamp_domain\":\"monotonic_ms\","
-       << "\"video_time_offset_ms\":" << config_.sync.video_time_offset_ms
+       << "\"healthy\":" << (metrics.sync_healthy ? "true" : "false") << ","
+       << "\"video_time_offset_ms\":" << config_.sync.video_time_offset_ms << ","
+       << "\"latest_audio_watermark_ms\":" << metrics.latest_audio_watermark_ms << ","
+       << "\"latest_visual_watermark_ms\":" << metrics.latest_visual_watermark_ms << ","
+       << "\"visual_watermark_lag_ms\":" << metrics.visual_watermark_lag_ms << ","
+       << "\"watermark_lag_ms\":" << metrics.watermark_lag_ms << ","
+       << "\"drift_ms_per_min\":" << metrics.drift_ms_per_min << ","
+       << "\"reanchor_count\":" << metrics.sync_reanchor_count << ","
+       << "\"asd_gated_windows\":" << metrics.asd_gated_windows
+       << "},"
+       << "\"metrics\":{"
+       << "\"frame_queue_depth\":" << metrics.frame_queue_depth << ","
+       << "\"frame_queue_dropped\":" << metrics.frame_queue_dropped << ","
+       << "\"face_queue_depth\":" << metrics.face_queue_depth << ","
+       << "\"face_queue_dropped\":" << metrics.face_queue_dropped << ","
+       << "\"person_detector_queue_depth\":" << metrics.person_detector_queue_depth << ","
+       << "\"person_detector_queue_dropped\":" << metrics.person_detector_queue_dropped << ","
+       << "\"audio_queue_depth\":" << metrics.audio_queue_depth << ","
+       << "\"video_fps\":" << metrics.video_fps << ","
+       << "\"person_detector_fps\":" << metrics.person_detector_fps << ","
+       << "\"face_pipeline_fps\":" << metrics.face_pipeline_fps << ","
+       << "\"asd_window_fps\":" << metrics.asd_window_fps << ","
+       << "\"person_detector_latency_p50_ms\":" << metrics.person_detector_latency_p50_ms << ","
+       << "\"person_detector_latency_p95_ms\":" << metrics.person_detector_latency_p95_ms << ","
+       << "\"face_pipeline_latency_p50_ms\":" << metrics.face_pipeline_latency_p50_ms << ","
+       << "\"face_pipeline_latency_p95_ms\":" << metrics.face_pipeline_latency_p95_ms << ","
+       << "\"asd_latency_p50_ms\":" << metrics.asd_latency_p50_ms << ","
+       << "\"asd_latency_p95_ms\":" << metrics.asd_latency_p95_ms << ","
+       << "\"direct_face_observation_ratio\":" << metrics.direct_face_observation_ratio << ","
+       << "\"asd_usable_window_ratio\":" << metrics.asd_usable_window_ratio << ","
+       << "\"preview\":{"
+       << "\"encode_fps\":" << metrics.preview_encode_fps << ","
+       << "\"encode_latency_p95_ms\":" << metrics.preview_encode_latency_p95_ms << ","
+       << "\"capture_to_send_p95_ms\":" << metrics.preview_capture_to_send_p95_ms << ","
+       << "\"frames_dropped\":" << metrics.preview_frames_dropped << ","
+       << "\"ws_dropped_frames\":" << metrics.preview_ws_dropped_frames << ","
+       << "\"pipe_frames_dropped\":" << metrics.pipe_frames_dropped << ","
+       << "\"pipe_backlog_bytes\":" << metrics.pipe_backlog_bytes << ","
+       << "\"frame_age_source\":\"" << EscapeJsonString(metrics.preview_frame_age_source) << "\""
+       << "},"
+       << "\"tracks\":{"
+       << "\"person_track_count\":" << metrics.person_track_count << ","
+       << "\"rendered_face_track_count\":" << metrics.rendered_face_track_count << ","
+       << "\"asd_candidate_count\":" << metrics.asd_candidate_count << ","
+       << "\"no_face_track_count\":" << metrics.no_face_track_count << ","
+       << "\"stale_geometry_rejected\":" << metrics.stale_geometry_rejected
+       << "},"
+       << "\"asd\":{"
+       << "\"vad_gate_skipped_windows\":" << metrics.asd_vad_skipped_windows << ","
+       << "\"usable_window_ratio\":" << metrics.asd_usable_window_ratio << ","
+       << "\"candidate_count\":" << metrics.asd_candidate_count << ","
+       << "\"model_latency_p95_ms\":" << metrics.asd_latency_p95_ms << ","
+       << "\"session_replay_enabled\":" << (metrics.session_replay_enabled ? "true" : "false")
+       << "}"
        << "},"
        << "\"latency_budget_ms\":{"
        << "\"binder_provisional_p95\":500,"
@@ -533,6 +660,10 @@ void GatewayServer::HttpThreadLoop() {
         
         ss << "\"face\":{"
            << "\"face_bbox_observed\":" << (t.face.face_bbox_observed ? "true" : "false") << ","
+           << "\"observation_state\":\"" << EscapeJsonString(t.face.observation_state) << "\","
+           << "\"face_bbox_last_observed_ms\":" << t.face.face_bbox_last_observed_ms << ","
+           << "\"geometry_age_ms\":" << t.face.geometry_age_ms << ","
+           << "\"embedding_eligible\":" << (t.face.embedding_eligible ? "true" : "false") << ","
            << "\"quality_score\":" << t.face.quality_score << ","
            << "\"bbox\":{\"x1\":" << t.face.bbox.x1 << ",\"y1\":" << t.face.bbox.y1 << ",\"x2\":" << t.face.bbox.x2 << ",\"y2\":" << t.face.bbox.y2 << "}"
            << "},";
@@ -541,6 +672,7 @@ void GatewayServer::HttpThreadLoop() {
            << "\"bbox\":{\"x1\":" << t.render.bbox.x1 << ",\"y1\":" << t.render.bbox.y1 << ",\"x2\":" << t.render.bbox.x2 << ",\"y2\":" << t.render.bbox.y2 << "},"
            << "\"label\":\"" << EscapeJsonString(t.render.label) << "\","
            << "\"color_state\":\"" << t.render.color_state << "\","
+           << "\"state\":\"" << t.render.state << "\","
            << "\"show_glow\":" << (t.render.show_glow ? "true" : "false")
            << "}";
            
@@ -554,6 +686,42 @@ void GatewayServer::HttpThreadLoop() {
        << "\"fatal_error\":\"" << EscapeJsonString(fatal_error) << "\""
        << "}";
     res.set_content(ss.str(), "application/json");
+  });
+
+  svr.Get("/v1/video.mjpg", [this](const Request&, Response& res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+    auto cursor = std::make_shared<std::uint64_t>(0);
+    res.set_chunked_content_provider(
+        "multipart/x-mixed-replace; boundary=frame",
+        [this, cursor](size_t, DataSink& sink) {
+          std::vector<std::uint8_t> jpeg;
+          {
+            std::unique_lock<std::mutex> lock(preview_mu_);
+            preview_cv_.wait_for(lock, std::chrono::milliseconds(100), [this, cursor] {
+              return !running_.load() || latest_preview_sequence_ > *cursor;
+            });
+            if (!running_.load()) {
+              return false;
+            }
+            if (latest_preview_sequence_ <= *cursor || latest_preview_jpeg_.empty()) {
+              return true;
+            }
+            jpeg = latest_preview_jpeg_;
+            *cursor = latest_preview_sequence_;
+          }
+          std::stringstream header;
+          header << "--frame\r\n"
+                 << "Content-Type: image/jpeg\r\n"
+                 << "Content-Length: " << jpeg.size() << "\r\n\r\n";
+          const auto header_text = header.str();
+          if (!sink.write(header_text.data(), header_text.size()) ||
+              !sink.write(reinterpret_cast<const char*>(jpeg.data()), jpeg.size())) {
+            return false;
+          }
+          static constexpr char suffix[] = "\r\n";
+          return sink.write(suffix, sizeof(suffix) - 1);
+        });
   });
 
   svr.Get("/v1/gallery", [this](const Request&, Response& res) {
@@ -625,7 +793,8 @@ void GatewayServer::HttpThreadLoop() {
       if (!decoded_img.empty() && pipeline_ && pipeline_->GetFaceEngine()) {
         cv::Mat mat = cv::imdecode(decoded_img, cv::IMREAD_COLOR);
         if (!mat.empty()) {
-          auto face_detections = pipeline_->GetFaceEngine()->DetectFaces(mat, 0.45F);
+          auto face_detections =
+              pipeline_->GetFaceEngine()->DetectFaces(mat, config_.face.det_confidence_threshold);
           if (!face_detections.empty()) {
             embedding = pipeline_->GetFaceEngine()->ExtractEmbedding(mat, face_detections[0].landmarks);
           }
@@ -740,14 +909,22 @@ void GatewayServer::HttpThreadLoop() {
   });
 
   // Server-Sent Events Endpoint
-  auto fusion_events_handler = [this](const Request&, Response& res) {
+  auto fusion_events_handler = [this](const Request& req, Response& res) {
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
     
+    auto cursor = std::make_shared<std::uint64_t>(0);
+    if (req.has_header("Last-Event-ID")) {
+      try {
+        *cursor = std::stoull(req.get_header_value("Last-Event-ID"));
+      } catch (...) {
+        *cursor = 0;
+      }
+    }
     res.set_chunked_content_provider(
         "text/event-stream; charset=utf-8",
-        [this](size_t offset, DataSink &sink) {
+        [this, cursor](size_t offset, DataSink &sink) {
           if (!sink.is_writable()) {
             return false;
           }
@@ -767,6 +944,7 @@ void GatewayServer::HttpThreadLoop() {
                   << "\"width\":" << config_.video.width << ","
                   << "\"height\":" << config_.video.height << ","
                   << "\"asd_active_threshold\":" << config_.asd.speaking_threshold << ","
+                  << "\"event_sequence\":" << pipeline_->LatestEventSequence() << ","
                   << "\"render_bbox\":" << (config_.video.render_bbox ? "true" : "false") << ","
                   << "\"vad_backend\":\"" << config_.vad.backend << "\""
                   << "}\n\n";
@@ -776,7 +954,7 @@ void GatewayServer::HttpThreadLoop() {
             }
           }
           
-          auto events = pipeline_->GetLatestEvents();
+          auto events = pipeline_->ReadEventsAfter(*cursor);
           if (events.empty()) {
             std::stringstream hb;
             hb << "data: {\"type\":\"heartbeat\",\"time_ms\":" 
@@ -791,10 +969,12 @@ void GatewayServer::HttpThreadLoop() {
           } else {
             for (const auto& ev : events) {
               std::string json_str = SerializeFusionEvent(ev);
-              std::string sse_evt = "data: " + json_str + "\n\n";
+              std::string sse_evt = "id: " + std::to_string(ev.event_sequence) +
+                                    "\ndata: " + json_str + "\n\n";
               if (!sink.write(sse_evt.data(), sse_evt.size())) {
                 break;
               }
+              *cursor = ev.event_sequence;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
           }

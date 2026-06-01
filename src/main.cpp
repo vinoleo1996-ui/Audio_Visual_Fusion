@@ -1,4 +1,5 @@
 #include "speaker_id/core/config.hpp"
+#include "speaker_id/core/audio_clock.hpp"
 #include "speaker_id/core/pipeline.hpp"
 #include "speaker_id/core/gateway_server.hpp"
 #include "speaker_id/modules/asd.hpp"
@@ -7,8 +8,12 @@
 #include "speaker_id/modules/fusion.hpp"
 #include "speaker_id/modules/vad.hpp"
 #include "speaker_id/modules/vision.hpp"
+#ifdef SPEAKER_ID_HAS_LIBAV
+#include "speaker_id/capture/libav_video_capture.hpp"
+#endif
 
 #include <opencv2/opencv.hpp>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -20,6 +25,10 @@
 #include <cstdio>
 #include <csignal>
 #include <cmath>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 std::atomic<bool> g_running{true};
 
@@ -34,7 +43,7 @@ int64_t MonotonicNowMs() {
 }
 
 // Helper to resolve camera name dynamically on macOS
-std::string ResolveCameraName() {
+std::string ResolveCameraName(const speaker_id::AppConfig& config) {
   std::string cmd = "ffmpeg -f avfoundation -list_devices true -i \"\" 2>&1";
   FILE* pipe = popen(cmd.c_str(), "r");
   if (!pipe) {
@@ -47,8 +56,12 @@ std::string ResolveCameraName() {
   }
   pclose(pipe);
 
-  std::vector<std::string> allowlist = {"FaceTime", "Built-in", "builtin", "内置", "内建"};
-  std::vector<std::string> denylist = {"iPhone", "iPad", "Continuity", "Desk View", "桌上视角", "Capture screen"};
+  const auto allowlist = config.video.camera_name_allowlist.empty()
+                             ? std::vector<std::string>{"FaceTime", "Built-in", "builtin", "内置", "内建"}
+                             : config.video.camera_name_allowlist;
+  const auto denylist = config.video.camera_name_denylist.empty()
+                            ? std::vector<std::string>{"iPhone", "iPad", "Continuity", "Desk View", "桌上视角", "Capture screen"}
+                            : config.video.camera_name_denylist;
 
   size_t pos = 0;
   while ((pos = result.find("[AVFoundation indev @", pos)) != std::string::npos) {
@@ -220,18 +233,33 @@ void AudioCaptureLoop(
     }
     return;
   }
+  const int audio_fd = fileno(fp);
+  fcntl(audio_fd, F_SETFL, fcntl(audio_fd, F_GETFL, 0) | O_NONBLOCK);
 
   const size_t chunk_samples =
       config.audio.sample_rate * config.audio.channels * config.audio.chunk_ms / 1000;
   std::vector<int16_t> read_buf(chunk_samples);
+  size_t audio_bytes_offset = 0;
   int64_t frame_count = 0;
-  int64_t stream_start_ms = 0;
-  int64_t total_samples_processed = 0;
+  speaker_id::AudioMonotonicPll audio_clock(
+      config.sync.reanchor_threshold_ms, config.sync.pll_alpha,
+      config.sync.max_correction_per_chunk_ms);
   bool audio_reported_ok = false;
 
   while (g_running) {
-    size_t read_bytes = fread(read_buf.data(), sizeof(int16_t), chunk_samples, fp);
-    if (read_bytes == 0) {
+    const auto bytes_read = read(
+        audio_fd,
+        reinterpret_cast<char*>(read_buf.data()) + audio_bytes_offset,
+        chunk_samples * sizeof(int16_t) - audio_bytes_offset);
+    if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                           errno == EINTR)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    if (bytes_read <= 0) {
+      if (!g_running) {
+        break;
+      }
       const std::string error = "audio stream reached EOF or returned an error";
       std::cerr << "Fatal: " << error << ".\n";
       gateway->ReportAudioStatus(false, error);
@@ -239,6 +267,12 @@ void AudioCaptureLoop(
       g_running = false;
       break;
     }
+    audio_bytes_offset += static_cast<std::size_t>(bytes_read);
+    if (audio_bytes_offset < chunk_samples * sizeof(int16_t)) {
+      continue;
+    }
+    const auto read_samples = chunk_samples;
+    audio_bytes_offset = 0;
     if (!audio_reported_ok) {
 #ifdef __APPLE__
       gateway->ReportAudioStatus(true, "", "ffmpeg_avfoundation");
@@ -248,39 +282,35 @@ void AudioCaptureLoop(
       audio_reported_ok = true;
     }
 
-    if (stream_start_ms == 0) {
-      stream_start_ms = MonotonicNowMs();
-    }
-
-    int64_t timestamp_ms =
-        stream_start_ms + (total_samples_processed * 1000 /
-                           (config.audio.sample_rate * config.audio.channels));
-    total_samples_processed += read_bytes;
-
     speaker_id::AudioChunkEvent chunk;
     chunk.stream_id = "mic";
-    chunk.timestamp_ms = timestamp_ms;
     chunk.duration_ms = static_cast<int>(
-        read_bytes * 1000 / (config.audio.sample_rate * config.audio.channels));
+        read_samples * 1000 / (config.audio.sample_rate * config.audio.channels));
+    const auto clock =
+        audio_clock.Stamp(MonotonicNowMs(), chunk.duration_ms);
+    chunk.timestamp_ms = clock.timestamp_ms;
+    chunk.clock_drift_ms = clock.drift_ms;
+    chunk.clock_drift_ms_per_min = clock.drift_ms_per_min;
+    chunk.clock_reanchored = clock.reanchored;
     chunk.sample_rate = config.audio.sample_rate;
-    chunk.data.reserve(read_bytes);
+    chunk.data.reserve(read_samples);
     double sum_sq = 0.0;
-    for (size_t i = 0; i < read_bytes; ++i) {
+    for (size_t i = 0; i < read_samples; ++i) {
       float val = static_cast<float>(read_buf[i]) / 32768.0f;
       chunk.data.push_back(val);
       sum_sq += val * val;
     }
-    double rms = std::sqrt(sum_sq / std::max<size_t>(1, read_bytes));
+    double rms = std::sqrt(sum_sq / std::max<size_t>(1, read_samples));
     static int chunk_count = 0;
     if (chunk_count++ % 100 == 0) {
-      std::cout << "[AudioCapture] Chunk " << chunk_count << ", read " << read_bytes << " samples, RMS: " << rms << "\n";
+      std::cout << "[AudioCapture] Chunk " << chunk_count << ", read " << read_samples << " samples, RMS: " << rms << "\n";
     }
 
     pipeline->PushAudio(chunk);
     frame_count++;
   }
 
-  pclose(fp);
+  fclose(fp);
 }
 
 // Global thread-safe camera frame buffer to prevent pipe accumulation latency
@@ -288,13 +318,40 @@ std::mutex g_video_mu;
 cv::Mat g_latest_video_frame;
 int64_t g_latest_video_timestamp_ms = 0;
 std::atomic<bool> g_new_video_frame{false};
+std::atomic<std::uint64_t> g_pipe_frames_dropped{0};
+std::atomic<std::size_t> g_pipe_backlog_bytes{0};
+std::mutex g_preview_mu;
+struct PreviewFrame {
+  cv::Mat frame;
+  std::uint64_t sequence = 0;
+  std::int64_t capture_timestamp_ms = 0;
+};
+PreviewFrame g_latest_preview_frame;
+std::atomic<bool> g_new_preview_frame{false};
+std::atomic<std::uint64_t> g_preview_frames_dropped{0};
 
 void FfmpegVideoCaptureLoop(FILE* fp, int width, int height) {
   size_t frame_bytes = width * height * 3;
   std::vector<uint8_t> buffer(frame_bytes);
+  const int video_fd = fileno(fp);
+  fcntl(video_fd, F_SETFL, fcntl(video_fd, F_GETFL, 0) | O_NONBLOCK);
+  size_t offset = 0;
   while (g_running) {
-    size_t bytes_read = fread(buffer.data(), 1, frame_bytes, fp);
-    if (bytes_read == frame_bytes) {
+    const auto bytes_read = read(video_fd, buffer.data() + offset, frame_bytes - offset);
+    if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                           errno == EINTR)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    if (bytes_read <= 0) {
+      if (!g_running) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    offset += static_cast<std::size_t>(bytes_read);
+    if (offset == frame_bytes) {
       cv::Mat frame(height, width, CV_8UC3, buffer.data());
       {
         std::lock_guard<std::mutex> lock(g_video_mu);
@@ -302,8 +359,78 @@ void FfmpegVideoCaptureLoop(FILE* fp, int width, int height) {
         g_latest_video_timestamp_ms = MonotonicNowMs();
         g_new_video_frame = true;
       }
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      offset = 0;
+      int available_bytes = 0;
+      if (ioctl(video_fd, FIONREAD, &available_bytes) == 0) {
+        g_pipe_backlog_bytes = static_cast<std::size_t>(std::max(0, available_bytes));
+        while (available_bytes >= static_cast<int>(frame_bytes * 2U)) {
+          std::size_t discarded = 0;
+          while (discarded < frame_bytes) {
+            const auto dropped = read(video_fd, buffer.data() + discarded,
+                                      frame_bytes - discarded);
+            if (dropped <= 0) {
+              break;
+            }
+            discarded += static_cast<std::size_t>(dropped);
+          }
+          if (discarded != frame_bytes) {
+            break;
+          }
+          ++g_pipe_frames_dropped;
+          available_bytes -= static_cast<int>(frame_bytes);
+        }
+      }
+    }
+  }
+}
+
+void PreviewEncodeLoop(
+    const speaker_id::PreviewConfig& config,
+    const std::string& frame_age_source,
+    std::shared_ptr<speaker_id::StreamingPipeline> pipeline,
+    std::shared_ptr<speaker_id::GatewayServer> gateway) {
+  const auto cadence = std::chrono::milliseconds(
+      std::max(1, 1000 / std::max(1, config.fps)));
+  auto next_encode_at = std::chrono::steady_clock::now();
+  while (g_running) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_encode_at) {
+      std::this_thread::sleep_until(next_encode_at);
+    }
+    next_encode_at = std::chrono::steady_clock::now() + cadence;
+    PreviewFrame preview;
+    {
+      std::lock_guard<std::mutex> lock(g_preview_mu);
+      if (g_new_preview_frame && !g_latest_preview_frame.frame.empty()) {
+        preview = g_latest_preview_frame;
+        g_new_preview_frame = false;
+      }
+    }
+    if (preview.frame.empty()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    try {
+      const auto encode_started_at = std::chrono::steady_clock::now();
+      cv::Mat resized;
+      cv::resize(preview.frame, resized, cv::Size(config.width, config.height),
+                 0.0, 0.0, cv::INTER_AREA);
+      std::vector<uint8_t> jpeg_bytes;
+      std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, config.jpeg_quality};
+      cv::imencode(".jpg", resized, jpeg_bytes, params);
+      gateway->BroadcastVideoFrame(
+          jpeg_bytes, preview.sequence, preview.capture_timestamp_ms);
+      const auto sent_at = std::chrono::steady_clock::now();
+      const double encode_latency_ms =
+          std::chrono::duration<double, std::milli>(sent_at - encode_started_at).count();
+      const double capture_to_send_ms =
+          static_cast<double>(MonotonicNowMs() - preview.capture_timestamp_ms);
+      pipeline->ReportPreviewFrame(
+          encode_latency_ms, capture_to_send_ms, g_preview_frames_dropped.load(),
+          gateway->VideoFramesDropped(), g_pipe_frames_dropped.load(),
+          g_pipe_backlog_bytes.load(), frame_age_source);
+    } catch (const std::exception& error) {
+      std::cerr << "Preview encode error: " << error.what() << "\n";
     }
   }
 }
@@ -326,6 +453,13 @@ int main(int argc, char* argv[]) {
     std::cerr << "Fatal error: " << e.what() << "\n";
     return 1;
   }
+#ifndef SPEAKER_ID_HAS_LIBAV
+  if (config.capture.backend == "libav_pts") {
+    std::cerr << "Fatal error: capture.backend=libav_pts was selected, but the "
+                 "libav PTS adapter is not linked in this Mac build yet.\n";
+    return 1;
+  }
+#endif
   if (config.runtime.use_cuda || config.runtime.use_tensorrt) {
     std::cerr
         << "Fatal error: this C++ build exposes CPU ONNX Runtime providers only. "
@@ -347,7 +481,10 @@ int main(int argc, char* argv[]) {
   try {
     std::cout << "Initializing Vision module: " << config.video.person_detector_model_path << "\n";
     vision = std::make_shared<speaker_id::YoloVisionBackend>(
-        config.video.person_detector_model_path, config.video.person_detector_conf_threshold);
+        config.video.person_detector_model_path,
+        std::min(config.video.person_detector_conf_threshold,
+                 config.video.tracker_low_confidence_threshold),
+        config.video.person_detector_imgsz, config.video.person_detector_nms_threshold);
 
     std::cout << "Initializing VAD module: " << config.vad.model_path << "\n";
     vad = std::make_shared<speaker_id::SileroVadBackend>(
@@ -377,8 +514,9 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Initializing Fusion module...\n";
     fusion = std::make_shared<speaker_id::RuleFusionBackend>(
-        config.video.width, config.fusion.visible_speaker_threshold,
-        config.fusion.visible_speaker_threshold * 0.6f);
+        config.video.width, config.asd.speaking_threshold,
+        config.fusion.visible_speaker_threshold, config.fusion.offscreen_threshold,
+        config.fusion.ambiguity_margin, config.fusion.allow_multi_speaker);
   } catch (const std::exception& error) {
     std::cerr << "Fatal error: runtime backend initialization failed: " << error.what()
               << "\n";
@@ -398,25 +536,50 @@ int main(int argc, char* argv[]) {
 
   // Spawn audio capture thread
   std::thread audio_capture_thread(AudioCaptureLoop, config, pipeline, gateway);
+  std::thread preview_encode_thread(
+      PreviewEncodeLoop, config.preview,
+      config.capture.backend == "libav_pts" ? "libav_pts" : "arrival_estimate",
+      pipeline, gateway);
 
   // Main camera capture loop
   cv::VideoCapture cap;
   FILE* video_fp = nullptr;
   bool use_ffmpeg_video = false;
+#ifdef SPEAKER_ID_HAS_LIBAV
+  std::unique_ptr<speaker_id::LibavVideoCapture> libav_video;
+  bool use_libav_video = false;
+#endif
 
 #ifdef __APPLE__
   if (config.video.source == "camera") {
-    std::string camera_name = ResolveCameraName();
+    std::string camera_name = ResolveCameraName(config);
     if (camera_name != "0") {
-      std::string ffmpeg_cmd = "ffmpeg -loglevel quiet -fflags nobuffer -flags low_delay -f avfoundation -r " + std::to_string(config.video.fps) +
-                               " -video_size " + std::to_string(config.video.width) + "x" + std::to_string(config.video.height) +
-                               " -i \"" + camera_name + "\" -pix_fmt bgr24 -f rawvideo -";
-      std::cout << "Opening FaceTime camera via FFmpeg command: " << ffmpeg_cmd << "\n";
-      video_fp = popen(ffmpeg_cmd.c_str(), "r");
-      if (video_fp) {
-        use_ffmpeg_video = true;
-      } else {
-        std::cerr << "Failed to open camera via FFmpeg. Falling back to OpenCV...\n";
+#ifdef SPEAKER_ID_HAS_LIBAV
+      if (config.capture.backend == "libav_pts") {
+        libav_video = std::make_unique<speaker_id::LibavVideoCapture>();
+        std::string error;
+        if (libav_video->Open(camera_name, config.video.width, config.video.height,
+                              config.video.fps, error)) {
+          use_libav_video = true;
+        } else {
+          std::cerr << "Fatal error: " << error << "\n";
+          gateway->ReportCameraStatus(false, error, "libav_pts");
+          gateway->ReportFatalError(error);
+          g_running = false;
+        }
+      } else
+#endif
+      {
+        std::string ffmpeg_cmd = "ffmpeg -loglevel quiet -fflags nobuffer -flags low_delay -f avfoundation -r " + std::to_string(config.video.fps) +
+                                 " -video_size " + std::to_string(config.video.width) + "x" + std::to_string(config.video.height) +
+                                 " -i \"" + camera_name + "\" -pix_fmt bgr24 -f rawvideo -";
+        std::cout << "Opening FaceTime camera via FFmpeg command: " << ffmpeg_cmd << "\n";
+        video_fp = popen(ffmpeg_cmd.c_str(), "r");
+        if (video_fp) {
+          use_ffmpeg_video = true;
+        } else {
+          std::cerr << "Failed to open camera via FFmpeg. Falling back to OpenCV...\n";
+        }
       }
     }
   }
@@ -427,7 +590,11 @@ int main(int argc, char* argv[]) {
     ffmpeg_video_thread = std::thread(FfmpegVideoCaptureLoop, video_fp, config.video.width, config.video.height);
   }
 
-  if (!use_ffmpeg_video && config.video.source == "camera") {
+  if (!use_ffmpeg_video
+#ifdef SPEAKER_ID_HAS_LIBAV
+      && !use_libav_video
+#endif
+      && config.video.source == "camera") {
     std::cout << "Opening camera index " << config.video.camera_index << "...\n";
     cap.open(config.video.camera_index);
     if (cap.isOpened()) {
@@ -458,6 +625,23 @@ int main(int argc, char* argv[]) {
     int64_t timestamp_ms = 0;
 
     bool read_success = false;
+#ifdef SPEAKER_ID_HAS_LIBAV
+    if (use_libav_video && libav_video) {
+      speaker_id::CapturedVideoFrame captured;
+      std::string error;
+      if (libav_video->ReadFrame(captured, error)) {
+        frame = std::move(captured.bgr);
+        timestamp_ms = captured.capture_timestamp_ms;
+        gateway->ReportCameraStatus(true, "", "libav_pts");
+        read_success = true;
+      } else {
+        gateway->ReportCameraStatus(false, error, "libav_pts");
+        gateway->ReportFatalError(error);
+        g_running = false;
+        break;
+      }
+    } else
+#endif
     if (use_ffmpeg_video && video_fp) {
       if (g_new_video_frame) {
         {
@@ -497,24 +681,27 @@ int main(int argc, char* argv[]) {
     }
 
     if (!frame.empty()) {
-      // Compress frame as JPEG
-      std::vector<uint8_t> jpeg_bytes;
-      std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 80};
-      cv::imencode(".jpg", frame, jpeg_bytes, params);
-
-      // Broadcast JPEG binary payload to web clients
-      gateway->BroadcastVideoFrame(jpeg_bytes);
-
-      // Push raw JPEG frame to StreamingPipeline for vision detection
       speaker_id::FrameEvent frame_event;
       frame_event.stream_id = "camera";
       frame_event.frame_id = frame_id++;
       frame_event.timestamp_ms = timestamp_ms;
       frame_event.width = frame.cols;
       frame_event.height = frame.rows;
-      frame_event.data = std::move(jpeg_bytes);
+      const cv::Mat contiguous_frame = frame.isContinuous() ? frame : frame.clone();
+      frame_event.data.assign(
+          contiguous_frame.datastart,
+          contiguous_frame.dataend);
+      pipeline->PushFrame(std::move(frame_event));
 
-      pipeline->PushFrame(frame_event);
+      {
+        std::lock_guard<std::mutex> lock(g_preview_mu);
+        if (g_new_preview_frame) {
+          ++g_preview_frames_dropped;
+        }
+        g_latest_preview_frame =
+            PreviewFrame{frame.clone(), static_cast<std::uint64_t>(frame_id - 1), timestamp_ms};
+        g_new_preview_frame = true;
+      }
     }
   }
 
@@ -530,13 +717,21 @@ int main(int argc, char* argv[]) {
   }
 
   gateway->Stop();
+  if (preview_encode_thread.joinable()) {
+    preview_encode_thread.join();
+  }
   pipeline->Stop();
 
   if (cap.isOpened()) {
     cap.release();
   }
+#ifdef SPEAKER_ID_HAS_LIBAV
+  if (libav_video) {
+    libav_video->Close();
+  }
+#endif
   if (video_fp) {
-    pclose(video_fp);
+    fclose(video_fp);
   }
 
   std::cout << "Shutdown complete.\n";

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,6 +19,7 @@ class WebSocketServer {
 
   // Send binary data (e.g. JPEG image) to all connected WebSocket clients
   void BroadcastBinary(const std::vector<uint8_t>& data);
+  std::uint64_t DroppedFrames() const { return dropped_frames_.load(); }
 
   int Port() const { return port_; }
 
@@ -33,6 +35,7 @@ class WebSocketServer {
 
   std::mutex clients_mu_;
   std::vector<int> client_fds_;
+  std::atomic<std::uint64_t> dropped_frames_{0};
 };
 
 }  // namespace speaker_id

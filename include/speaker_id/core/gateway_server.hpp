@@ -5,6 +5,8 @@
 #include "speaker_id/core/websocket_server.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,7 +28,10 @@ class GatewayServer {
   bool Start();
   void Stop();
 
-  void BroadcastVideoFrame(const std::vector<uint8_t>& jpeg_bytes);
+  void BroadcastVideoFrame(const std::vector<uint8_t>& jpeg_bytes,
+                           std::uint64_t frame_sequence,
+                           std::int64_t capture_timestamp_ms);
+  std::uint64_t VideoFramesDropped() const;
   void ReportCameraStatus(
       bool ok,
       const std::string& error = "",
@@ -49,6 +54,10 @@ class GatewayServer {
   AppConfig config_;
   std::shared_ptr<StreamingPipeline> pipeline_;
   std::unique_ptr<WebSocketServer> ws_server_;
+  mutable std::mutex preview_mu_;
+  std::condition_variable preview_cv_;
+  std::vector<std::uint8_t> latest_preview_jpeg_;
+  std::uint64_t latest_preview_sequence_ = 0;
   
   std::atomic<bool> running_{false};
   std::thread http_thread_;

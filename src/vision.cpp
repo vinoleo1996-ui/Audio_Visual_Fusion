@@ -13,18 +13,31 @@ struct YoloVisionBackend::Impl {
   Ort::SessionOptions session_options;
   std::unique_ptr<Ort::Session> session;
 
-  float confidence_threshold = 0.35f;
+  float confidence_floor = 0.15F;
+  float nms_threshold = 0.45F;
+  int input_size = 640;
 
-  Impl(const std::string& model_path, float threshold_val)
-      : confidence_threshold(threshold_val) {
+  Impl(
+      const std::string& model_path,
+      float confidence_floor_val,
+      int input_size_val,
+      float nms_threshold_val)
+      : confidence_floor(confidence_floor_val),
+        nms_threshold(nms_threshold_val),
+        input_size(std::max(32, input_size_val)) {
     session_options.SetIntraOpNumThreads(1);
     session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     session = std::make_unique<Ort::Session>(env, model_path.c_str(), session_options);
   }
 };
 
-YoloVisionBackend::YoloVisionBackend(const std::string& model_path, float confidence_threshold)
-    : impl_(std::make_unique<Impl>(model_path, confidence_threshold)) {}
+YoloVisionBackend::YoloVisionBackend(
+    const std::string& model_path,
+    float confidence_floor,
+    int input_size,
+    float nms_threshold)
+    : impl_(std::make_unique<Impl>(
+          model_path, confidence_floor, input_size, nms_threshold)) {}
 
 YoloVisionBackend::~YoloVisionBackend() = default;
 
@@ -47,12 +60,21 @@ std::vector<TrackEvent> YoloVisionBackend::AcceptFrame(const FrameEvent& frame) 
     return tracks;
   }
 
-  const int target_w = 640;
-  const int target_h = 640;
+  const int target_w = impl_->input_size;
+  const int target_h = impl_->input_size;
+  const float scale = std::min(
+      static_cast<float>(target_w) / static_cast<float>(img.cols),
+      static_cast<float>(target_h) / static_cast<float>(img.rows));
+  const int resized_w = std::max(1, static_cast<int>(std::round(img.cols * scale)));
+  const int resized_h = std::max(1, static_cast<int>(std::round(img.rows * scale)));
+  const int pad_x = (target_w - resized_w) / 2;
+  const int pad_y = (target_h - resized_h) / 2;
   
   cv::Mat resized;
-  cv::resize(img, resized, cv::Size(target_w, target_h));
-  cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
+  cv::resize(img, resized, cv::Size(resized_w, resized_h));
+  cv::Mat letterboxed(target_h, target_w, CV_8UC3, cv::Scalar(114, 114, 114));
+  resized.copyTo(letterboxed(cv::Rect(pad_x, pad_y, resized_w, resized_h)));
+  cv::cvtColor(letterboxed, letterboxed, cv::COLOR_BGR2RGB);
 
   std::vector<float> input_tensor_values(1 * 3 * target_w * target_h);
   float* input_data = input_tensor_values.data();
@@ -60,7 +82,7 @@ std::vector<TrackEvent> YoloVisionBackend::AcceptFrame(const FrameEvent& frame) 
   for (int c = 0; c < 3; ++c) {
     for (int h = 0; h < target_h; ++h) {
       for (int w = 0; w < target_w; ++w) {
-        input_data[c * target_h * target_w + h * target_w + w] = resized.at<cv::Vec3b>(h, w)[c] / 255.0f;
+        input_data[c * target_h * target_w + h * target_w + w] = letterboxed.at<cv::Vec3b>(h, w)[c] / 255.0f;
       }
     }
   }
@@ -109,78 +131,76 @@ std::vector<TrackEvent> YoloVisionBackend::AcceptFrame(const FrameEvent& frame) 
       float x2 = output_data[i * 6 + 2];
       float y2 = output_data[i * 6 + 3];
       float confidence = output_data[i * 6 + 4];
-      float class_id_val = output_data[i * 6 + 5];
-      int class_id = static_cast<int>(std::round(class_id_val));
+      float class_id = output_data[i * 6 + 5];
 
-      if (class_id == person_class_id) {
+      if (static_cast<int>(std::round(class_id)) == person_class_id) {
         static int print_count = 0;
         if (print_count < 20) {
           std::cout << "[Vision] YOLO26 candidate: conf=" << confidence 
                     << ", box=[" << x1 << ", " << y1 << ", " << x2 << ", " << y2 << "]\n";
           print_count++;
         }
-      }
-
-      if (confidence >= impl_->confidence_threshold) {
-        int left = static_cast<int>(std::max(0.0f, x1) / target_w * img.cols);
-        int top = static_cast<int>(std::max(0.0f, y1) / target_h * img.rows);
-        int right = static_cast<int>(std::min(static_cast<float>(target_w), x2) / target_w * img.cols);
-        int bottom = static_cast<int>(std::min(static_cast<float>(target_h), y2) / target_h * img.rows);
-        
-        int width = right - left;
-        int height = bottom - top;
-        if (width > 0 && height > 0) {
-          boxes.push_back(cv::Rect(left, top, width, height));
-          confidences.push_back(confidence);
-          class_ids.push_back(class_id);
+        if (confidence >= impl_->confidence_floor) {
+          int left = static_cast<int>(std::round((x1 - pad_x) / scale));
+          int top = static_cast<int>(std::round((y1 - pad_y) / scale));
+          int right = static_cast<int>(std::round((x2 - pad_x) / scale));
+          int bottom = static_cast<int>(std::round((y2 - pad_y) / scale));
+          left = std::clamp(left, 0, img.cols);
+          top = std::clamp(top, 0, img.rows);
+          right = std::clamp(right, 0, img.cols);
+          bottom = std::clamp(bottom, 0, img.rows);
+          
+          int width = right - left;
+          int height = bottom - top;
+          if (width > 0 && height > 0) {
+            boxes.push_back(cv::Rect(left, top, width, height));
+            confidences.push_back(confidence);
+            class_ids.push_back(person_class_id);
+          }
         }
       }
     }
   } else if (output_shape.size() == 3) {
     // Standard YOLOv8 output shape: [1, 84, 8400]
     int cols = static_cast<int>(output_shape[2]);
-    int num_classes = static_cast<int>(output_shape[1]) - 4;
     const int class_offset = 4;
 
     for (int i = 0; i < cols; ++i) {
-      int best_class_id = -1;
-      float max_class_score = 0.0f;
-      for (int c = 0; c < num_classes; ++c) {
-        float score = output_data[(class_offset + c) * cols + i];
-        if (score > max_class_score) {
-          max_class_score = score;
-          best_class_id = c;
-        }
-      }
-
-      if (best_class_id >= 0 && max_class_score >= impl_->confidence_threshold) {
+      float class_score = output_data[(class_offset + person_class_id) * cols + i];
+      if (class_score >= impl_->confidence_floor) {
         float cx = output_data[0 * cols + i];
         float cy = output_data[1 * cols + i];
         float w = output_data[2 * cols + i];
         float h = output_data[3 * cols + i];
 
-        int left = static_cast<int>((cx - w * 0.5f) / target_w * img.cols);
-        int top = static_cast<int>((cy - h * 0.5f) / target_h * img.rows);
-        int width = static_cast<int>(w / target_w * img.cols);
-        int height = static_cast<int>(h / target_h * img.rows);
+        int left = static_cast<int>(std::round((cx - w * 0.5F - pad_x) / scale));
+        int top = static_cast<int>(std::round((cy - h * 0.5F - pad_y) / scale));
+        int right = static_cast<int>(std::round((cx + w * 0.5F - pad_x) / scale));
+        int bottom = static_cast<int>(std::round((cy + h * 0.5F - pad_y) / scale));
+        left = std::clamp(left, 0, img.cols);
+        top = std::clamp(top, 0, img.rows);
+        right = std::clamp(right, 0, img.cols);
+        bottom = std::clamp(bottom, 0, img.rows);
+        int width = right - left;
+        int height = bottom - top;
 
-        boxes.push_back(cv::Rect(left, top, width, height));
-        confidences.push_back(max_class_score);
-        class_ids.push_back(best_class_id);
+        if (width > 0 && height > 0) {
+          boxes.push_back(cv::Rect(left, top, width, height));
+          confidences.push_back(class_score);
+          class_ids.push_back(person_class_id);
+        }
       }
     }
   }
 
   std::vector<int> indices;
   if (!boxes.empty()) {
-    cv::dnn::NMSBoxes(boxes, confidences, impl_->confidence_threshold, 0.45f, indices);
+    cv::dnn::NMSBoxes(
+        boxes, confidences, impl_->confidence_floor, impl_->nms_threshold, indices);
   }
 
   int track_id_counter = 0;
   for (int idx : indices) {
-    if (class_ids[idx] != person_class_id) {
-      continue;
-    }
     TrackEvent track;
     track.person_track_id = ++track_id_counter;
     track.bbox = BBox{
