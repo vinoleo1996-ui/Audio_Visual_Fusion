@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Real-time multi-modal speaker identification demo with video tracking, face recognition, and audio-visual active speaker detection." />
+    <title>Video Speaker ID</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage-panel" aria-label="camera detection view">
+        <div class="toolbar">
+          <div>
+            <h1>Video Speaker ID</h1>
+            <p id="runtimeStatus">Initializing camera...</p>
+          </div>
+          <div class="toolbar-actions">
+            <button id="clearChat" type="button">Clear</button>
+          </div>
+        </div>
+
+        <div class="video-wrap">
+          <canvas id="videoCanvas" width="1280" height="720"></canvas>
+          <img id="backendVideo" alt="backend camera detection stream" style="display:none" />
+          <canvas id="overlay"></canvas>
+          <div class="legend" aria-label="quality legend">
+            <span><i class="dot good"></i>Good</span>
+            <span><i class="dot ok"></i>OK</span>
+            <span><i class="dot low"></i>Low</span>
+          </div>
+        </div>
+
+        <div class="metrics">
+          <span id="speakerState">speaker: unknown</span>
+          <span id="confidenceState">confidence: --</span>
+          <span id="latencyState">latency: --</span>
+          <span id="modeState">mode: connecting</span>
+          <span id="syncState">sync: waiting</span>
+        </div>
+        <div id="liveSubtitle" class="live-subtitle" aria-live="polite"></div>
+      </section>
+
+      <aside class="chat-panel" aria-label="speaker transcript bubbles">
+        <div class="chat-header">
+          <h2>Transcript</h2>
+          <span id="eventState">waiting</span>
+        </div>
+        <div id="chatList" class="chat-list"></div>
+
+        <!-- Face Registry Panel -->
+        <div class="gallery-header">
+          <h2>Face Registry</h2>
+          <button id="uploadTrigger" type="button">Register Face</button>
+        </div>
+        <div id="galleryContainer" class="gallery-container">
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" id="imageInput" accept="image/*" style="display: none;" />
+            <input type="text" id="registerName" placeholder="姓名" autocomplete="off" />
+            <input type="text" id="registerBackground" placeholder="背景信息" autocomplete="off" />
+            <p>上传一张清晰单人照片来提取人脸向量</p>
+          </div>
+          <div id="galleryList" class="gallery-list"></div>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="./app.js?v=1.0.1"></script>
+  </body>
+</html>

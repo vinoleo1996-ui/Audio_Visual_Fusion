@@ -26,6 +26,10 @@
 │   └── modules/           # 各模型推理模块实现 (ASD、ASR、Face、Diarization)
 ├── tests/                 # 单元测试与集成测试
 │   └── core_tests.cpp     # C++ 单元测试回归集
+├── ui/                    # [新增] 前端 Web 界面代码 (HTML/CSS/JS)
+│   ├── index.html         # UI 结构主页面
+│   ├── styles.css         # UI 美化样式
+│   └── app.js             # UI 交互与 WebSocket 推送渲染逻辑
 ├── configs/               # 运行时配置文件
 │   ├── live_mac.yaml      # 本地 Mac 摄像头实时体验配置
 │   └── orin_nx.yaml       # Jetson Orin NX 边缘部署配置
