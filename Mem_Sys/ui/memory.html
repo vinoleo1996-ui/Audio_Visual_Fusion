@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="端侧机器人记忆萃取体验台" />
+    <title>Memory Lab · 端侧记忆萃取</title>
+    <link rel="stylesheet" href="/memory/ui/memory_styles.css" />
+  </head>
+  <body>
+    <main class="memory-shell">
+      <header class="topbar">
+        <div>
+          <h1>人物记忆档案</h1>
+          <p id="serviceStatus">connecting</p>
+        </div>
+        <div class="runtime-pills">
+          <span id="modelPill">model</span>
+          <span id="dbPill">db</span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section class="person-panel" aria-label="person dossiers">
+          <div class="panel-head">
+            <h2>人物</h2>
+            <button id="refreshPeople" type="button">刷新</button>
+          </div>
+          <div id="personList" class="person-list"></div>
+        </section>
+
+        <section class="input-panel" aria-label="memory input">
+          <div class="panel-head">
+            <h2>给人物追加事件</h2>
+            <div class="tabs" role="tablist">
+              <button class="tab active" id="formTab" type="button">表单</button>
+              <button class="tab" id="jsonTab" type="button">JSON</button>
+            </div>
+          </div>
+
+          <form id="memoryForm" class="form-grid">
+            <label>
+              人物 ID
+              <input id="personId" value="person_demo_liuzhe" autocomplete="off" />
+            </label>
+            <label>
+              昵称
+              <input id="displayName" value="刘哲" autocomplete="off" />
+            </label>
+            <label>
+              说话状态
+              <select id="speakerState">
+                <option value="known_visible_speaker">known_visible_speaker</option>
+                <option value="known_offscreen_speaker">known_offscreen_speaker</option>
+                <option value="uncertain">uncertain</option>
+                <option value="overlap_speech">overlap_speech</option>
+              </select>
+            </label>
+            <label>
+              ASR 置信度
+              <input id="asrConfidence" type="number" min="0" max="1" step="0.01" value="0.92" />
+            </label>
+            <label class="wide">
+              用户说了什么
+              <textarea id="utteranceText" rows="5">明天下午三点提醒我开产品评审会，我喜欢会议前十分钟收到提醒。</textarea>
+            </label>
+            <label class="wide">
+              慢反应场景
+              <textarea id="sceneSummary" rows="3">用户坐在办公桌前，面前有笔记本电脑和两部手机，正在处理工作。</textarea>
+            </label>
+            <label class="wide">
+              机器人回复
+              <input id="replyText" value="好的，我会在明天下午三点前提醒你。" autocomplete="off" />
+            </label>
+            <label class="wide">
+              Commands JSON
+              <textarea id="commandsJson" rows="4">[
+  {"command":"schedule_reminder","ok":true,"message":"created reminder for product review"}
+]</textarea>
+            </label>
+
+            <div class="switch-row wide">
+              <label class="switch"><input id="allowMemory" type="checkbox" checked /> <span>allow_memory_write</span></label>
+              <label class="switch"><input id="allowProfile" type="checkbox" checked /> <span>allow_profile_write</span></label>
+              <label class="switch"><input id="needClarification" type="checkbox" /> <span>need_clarification</span></label>
+            </div>
+
+            <div class="actions wide">
+              <button id="extractButton" class="primary" type="submit">萃取</button>
+              <button id="samplePreference" type="button">偏好样例</button>
+              <button id="sampleBlocked" type="button">禁止写入样例</button>
+              <button id="resetButton" type="button">重置</button>
+            </div>
+          </form>
+
+          <div id="jsonPane" class="json-pane hidden">
+            <textarea id="jsonInput" spellcheck="false"></textarea>
+            <div class="actions">
+              <button id="syncFromForm" type="button">同步表单</button>
+              <button id="extractJsonButton" class="primary" type="button">萃取 JSON</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="result-panel" aria-label="memory result">
+          <div class="panel-head">
+            <div>
+              <h2 id="dossierTitle">人物档案</h2>
+              <span id="lastEvent">选择一个人物后查看其短中长期记忆</span>
+            </div>
+            <div class="actions compact-actions">
+              <button id="refreshTiers" type="button">刷新</button>
+              <button id="mergeProfile" type="button">归纳长期</button>
+            </div>
+          </div>
+
+          <div class="gate-strip" id="gateStrip">
+            <span>gate</span>
+            <strong>waiting</strong>
+          </div>
+          <div class="tier-stats" id="tierStats">
+            <span>L0 0</span>
+            <span>短期 0</span>
+            <span>中期 0</span>
+            <span>长期 0</span>
+          </div>
+
+          <div class="result-grid">
+            <section class="output-block">
+              <h3>短期记忆</h3>
+              <div id="shortTermList" class="memory-list"></div>
+            </section>
+
+            <section class="output-block">
+              <h3>中期记忆</h3>
+              <div id="atomsList" class="atom-list"></div>
+            </section>
+
+            <section class="output-block">
+              <h3>长期记忆</h3>
+              <div id="profileList" class="profile-list"></div>
+            </section>
+
+            <section class="output-block">
+              <h3>证据账本 L0</h3>
+              <div id="rawLedgerList" class="memory-list"></div>
+            </section>
+
+            <section class="output-block wide-result">
+              <h3>Debug Envelope / Response</h3>
+              <pre id="rawOutput">{}</pre>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="/memory/ui/memory_app.js"></script>
+  </body>
+</html>
